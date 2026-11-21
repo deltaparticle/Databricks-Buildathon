@@ -1,0 +1,46 @@
+name: debug
+
+# Sanitizer and gdb runs of the C++ pipeline on the dev set and a 20M set.
+on:
+  workflow_dispatch:
+    inputs:
+      big:
+        description: "Also run on 20M events (1 = yes)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/gen-lowmem/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          g++ -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -march=x86-64-v3 -std=c++20 -pthread -o asan cpp/main.cpp cpp/fallback.cpp
+          g++ -O3 -g -march=x86-64-v3 -mtune=skylake-avx512 -std=c++20 -pthread -o cppbin cpp/main.cpp cpp/fallback.cpp
+          sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
+          pip install --quiet polars
+      - name: Data
+        run: |
+          G=tools/gen-lowmem/target/release/generate
+          $G --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" 2>&1 | tail -1
+          if [ "${{ github.event.inputs.big }}" = 1 ]; then $G --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1; fi
+      - name: gdb (optimized)
+        run: |
+          gdb -batch -ex run -ex bt -ex "info locals" --args env DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 ./cppbin 2>&1 | tail -60
+      - name: ASan
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 ./asan 2>&1 | head -80 || true
+      - name: Compare
+        run: |
+          for d in dev p20; do [ -d "$RUNNER_TEMP/$d" ] || continue
+            a=$(mktemp -d); b=$(mktemp -d)
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a" NCPU=$(nproc) VERBOSE=1 ./cppbin 2>&1 | tail -14
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
+            echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -3)"
+          done
