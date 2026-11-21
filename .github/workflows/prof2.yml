@@ -111,20 +111,14 @@ jobs:
           done
       - name: Timing (interleaved)
         run: python3 tools/kern.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds || '15' }} tools/${{ github.event.inputs.variants || 'kern_v1.txt' }}
-      - name: perf (container, system-wide, comm pipeline)
+      - name: perf (native musl, per env set)
         run: |
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
           sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
-          FLAGS="--network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --memory 14g --memory-swap 14g --user 1000:1000 --cpus $(nproc)"
-          for img in cur $(docker images --format '{{.Repository}}' | grep '^v-' | head -2 || true); do
-            o=$(mktemp -d); chmod 777 $o
-            id=$(docker create $FLAGS -v "$RUNNER_TEMP/p20":/data:ro -v $o:/output -e NCPU=$(nproc) $img)
-            sudo $PERF record -a -g -F 4999 -o perf-$img.data -- docker start -a $id >/dev/null 2>&1
-            docker rm $id >/dev/null
-            echo "===== $img: by dso (comm pipeline)"
-            sudo $PERF report -i perf-$img.data --comm pipeline --no-children --sort dso --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -5
-            echo "===== $img: kernel symbols (comm pipeline)"
-            sudo $PERF report -i perf-$img.data --comm pipeline --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | grep "\[k\]" | head -30
-            echo "===== $img: all comms"
-            sudo $PERF report -i perf-$img.data --no-children --sort comm --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -12
+          for e in XL_NONE=1 ${{ github.event.inputs.envs || '' }}; do
+            $PERF record -F 9999 -o p.data env $e DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./muslbin >/dev/null 2>&1
+            echo "===== [$e] by dso"
+            $PERF report -i p.data --no-children --sort dso --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -4
+            echo "===== [$e] kernel symbols"
+            $PERF report -i p.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | grep "\[k\]" | head -25
           done

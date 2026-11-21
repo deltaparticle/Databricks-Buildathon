@@ -1,0 +1,7 @@
+# label  kind  target  [ENV=VAL] [--docker-flag]
+cur         docker  cur
+cur2        docker  cur
+popr        docker  cur  XL_POPR=1
+rel0        docker  cur  XL_REL=0
+relk32      docker  cur  XL_RELK=32
+ioadv0      docker  cur  XL_IOADV=0
