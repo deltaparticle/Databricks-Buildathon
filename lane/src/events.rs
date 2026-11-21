@@ -341,10 +341,17 @@ unsafe fn scatter_chunk12(p: *const u8, n: usize, slots: *mut Rec, gen: u64, nex
             _mm_prefetch::<_MM_HINT_T0>(a);
         }
     };
+    // CK2: also prefetch the chunk after next into L2 (its link sits in the next
+    // chunk, whose link line was prefetched one chunk ago; a stale link of a last
+    // chunk only prefetches a harmless address).
+    let nn = if CK2 && !nx_ok.is_null() { *((nx_ok as usize + crate::parse::LINK_OFF) as *const usize) as *const i8 } else { std::ptr::null() };
     let mut i = 0usize;
     while i + 4 <= n {
         if PF_CHUNK {
             ckpf(nextc.wrapping_add(i * 12));
+        }
+        if CK2 {
+            _mm_prefetch::<_MM_HINT_T1>(nn.wrapping_add(i * 12));
         }
         if SPF > 0 {
             pre(i + SPF);
@@ -455,6 +462,7 @@ unsafe fn sr_drain(buf: *mut u8, cnt: &mut [u32; SRP], slots: *mut Rec, gen: u64
 const BLESS: u32 = crate::env_u32(option_env!("XL_BLESS"), 0);
 // Hint of the next-chunk prefetch in scatter_chunk12: 0 T0 (shipped), 1 T1, 2 T2, 3 NTA.
 const CKH: u32 = crate::env_u32(option_env!("XL_CKH"), 0);
+const CK2: bool = crate::env_u32(option_env!("XL_CK2"), 0) == 1;
 #[inline(always)]
 unsafe fn ckpf(a: *const i8) {
     match CKH {
