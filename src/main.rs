@@ -380,12 +380,12 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>], tsc: &mut ts::DateCache) {
     if f[0].is_empty() {
         return;
     }
     let ekey = keys::key(f[0]);
-    let ingest = ts::parse(f[3]);
+    let ingest = ts::parse_c(f[3], tsc);
     let ingest_key = match ingest {
         Some(t) => (t.div_euclid(1000) + INGEST_BIAS).clamp(0, (1 << 40) - 1) as u64,
         None => (1 << 40) - 1,
@@ -395,7 +395,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
         }
-        let Some(t) = ts::parse(f[2]) else { break 'valid };
+        let Some(t) = ts::parse_c(f[2], tsc) else { break 'valid };
         if t < ctx.ws || t >= ctx.we {
             break 'valid;
         }
@@ -422,11 +422,11 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
 }
 
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>) {
+fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>, tsc: &mut ts::DateCache) {
     if f[0].is_empty() || f[1].is_empty() {
         return;
     }
-    let Some(t) = ts::parse(f[3]) else { return };
+    let Some(t) = ts::parse_c(f[3], tsc) else { return };
     if t < ctx.cws || t >= ctx.we {
         return;
     }
@@ -699,6 +699,7 @@ impl SmallIndex {
 }
 
 struct P1 {
+    tsc: ts::DateCache,
     prof: [f64; 2],
     ev: Vec<Vec<Ev>>,
     cl: Vec<Cl>,
@@ -900,16 +901,18 @@ fn bench_parse(ctx: &Ctx, path: &str) {
         csv::scan::<7>(body, |f| n += f[6].len());
         let scan = t.elapsed().as_secs_f64();
         let mut b = Scatter0::new();
+        let mut tsc = ts::DateCache::new();
         for v in b.0.iter_mut() {
             v.resize(v.capacity(), Ev { ekey: 0, ukey: 0, ip: 0, ts: 0, cat: 0 });
             v.clear();
         }
         let t = Instant::now();
-        csv::scan::<7>(body, |f| parse_event(f, ctx, &mut b.0));
+        csv::scan::<7>(body, |f| parse_event(f, ctx, &mut b.0, &mut tsc));
         let full = t.elapsed().as_secs_f64();
         let t = Instant::now();
         let mut x = 0i64;
-        csv::scan::<7>(body, |f| x ^= ts::parse(f[2]).unwrap_or(0) ^ ts::parse(f[3]).unwrap_or(0));
+        let mut tsc2 = ts::DateCache::new();
+        csv::scan::<7>(body, |f| x ^= ts::parse_c(f[2], &mut tsc2).unwrap_or(0) ^ ts::parse_c(f[3], &mut tsc2).unwrap_or(0));
         let tsp = t.elapsed().as_secs_f64() - scan;
         let t = Instant::now();
         let mut y = 0u64;
@@ -1041,6 +1044,7 @@ fn main() {
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
+                tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
                 ev: (0..P).map(|_| Vec::with_capacity(est_events / threads / P * 5 / 4)).collect(),
                 cl: Vec::with_capacity(est_clicks / threads * 5 / 4),
@@ -1050,11 +1054,11 @@ fn main() {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice = &event_files[fi][a..b];
-                    csv::scan::<7>(slice, |f| parse_event(f, &ctx, &mut st.ev));
+                    csv::scan::<7>(slice, |f| parse_event(f, &ctx, &mut st.ev, &mut st.tsc));
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice = &click_files[fi][a..b];
-                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl));
+                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl, &mut st.tsc));
                 }
                 st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },

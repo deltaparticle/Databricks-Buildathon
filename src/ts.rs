@@ -133,6 +133,107 @@ fn civil19(s: &[u8]) -> Option<i64> {
     Some(days * DAY + ((hour * 60 + minute) * 60 + second) * SECOND)
 }
 
+/// Day numbers of recently seen `YYYY-MM-DD` dates. A dataset's valid
+/// timestamps fall on a few dozen dates, so the date half of most ISO
+/// timestamps is a lookup; only dates that validated go in.
+pub struct DateCache {
+    key: [u64; 64],
+    key2: [u16; 64],
+    days: [i64; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        Self { key: [0; 64], key2: [0; 64], days: [0; 64] }
+    }
+}
+
+impl Default for DateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validated `YYYY-MM-DD` at 0..10 as days since the epoch.
+#[inline(always)]
+fn date_days(s: &[u8]) -> Option<i64> {
+    const DATE: u64 = lanes([b'0', b'0', b'0', b'0', b'-', b'0', b'0', b'-']);
+    const DATE_DIGITS: u64 = lanes([0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0]);
+    let d = swar_check(le8(s, 0), DATE, DATE_DIGITS)?;
+    let d1 = s[8].wrapping_sub(b'0') as i64;
+    let d2 = s[9].wrapping_sub(b'0') as i64;
+    if d1 > 9 || d2 > 9 {
+        return None;
+    }
+    let dp = pairs(d);
+    let year = (dp & 0xFF) as i64 * 100 + ((dp >> 16) & 0xFF) as i64;
+    let month = ((dp >> 40) & 0xFF) as i64;
+    let day = d1 * 10 + d2;
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    let y = year - TABLE_FIRST_YEAR;
+    Some(if (0..TABLE_YEARS as i64).contains(&y) {
+        MONTH_START[(y * 12 + month - 1) as usize] as i64 + day - 1
+    } else {
+        days_from_civil(year, month, day)
+    })
+}
+
+/// `civil19` with the date half looked up in `cache`.
+#[inline(always)]
+fn civil19_c(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    const TIME: u64 = lanes([b'0', b'0', b':', b'0', b'0', b':', b'0', b'0']);
+    const TIME_DIGITS: u64 = lanes([0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 0xFF, 0xFF]);
+    let t = swar_check(le8(s, 11), TIME, TIME_DIGITS)?;
+    if s[10] != b'T' {
+        return None;
+    }
+    let tp = pairs(t);
+    let hour = (tp & 0xFF) as i64;
+    let minute = ((tp >> 24) & 0xFF) as i64;
+    let second = ((tp >> 48) & 0xFF) as i64;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let k = le8(s, 0);
+    let k2 = u16::from_le_bytes([s[8], s[9]]);
+    let i = ((k ^ (k2 as u64) << 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+    let days = if cache.key[i] == k && cache.key2[i] == k2 {
+        cache.days[i]
+    } else {
+        let d = date_days(s)?;
+        cache.key[i] = k;
+        cache.key2[i] = k2;
+        cache.days[i] = d;
+        d
+    };
+    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * SECOND)
+}
+
+/// `parse` with a date cache (same results).
+#[inline(always)]
+pub fn parse_c(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    let n = s.len();
+    if n == 20 && s[19] == b'Z' {
+        return civil19_c(s, cache);
+    }
+    if n == 25 && (s[19] == b'+' || s[19] == b'-') {
+        if s[22] != b':' {
+            return None;
+        }
+        let oh = d2(s, 20)?;
+        let om = d2(s, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let offset = (oh * 60 + om) * MINUTE;
+        let local = civil19_c(s, cache)?;
+        return Some(if s[19] == b'+' { local - offset } else { local + offset });
+    }
+    parse_f3(s)
+}
+
 /// The straightforward version, kept as the reference for tests.
 #[cfg(test)]
 fn civil19_ref(s: &[u8]) -> Option<i64> {
@@ -268,6 +369,7 @@ mod tests {
             b"2027-02-28T12:30:45Z", b"2025-01-01T09:05:07Z", b"2100-02-28T23:59:59Z",
         ];
         let alphabet = b"0123456789:-TtZz +/9";
+        let mut cache = DateCache::new();
         for i in 0..400_000 {
             let mut v = seeds[i % seeds.len()].to_vec();
             for _ in 0..(next() % 3) {
@@ -275,6 +377,7 @@ mod tests {
                 v[at] = alphabet[(next() % alphabet.len() as u64) as usize];
             }
             assert_eq!(civil19(&v), civil19_ref(&v), "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(civil19_c(&v, &mut cache), civil19_ref(&v), "cached {:?}", String::from_utf8_lossy(&v));
         }
         for i in 0..400_000u64 {
             let mut v = format!("{:013}", next() % 10_000_000_000_000).into_bytes();
