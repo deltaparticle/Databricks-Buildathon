@@ -59,7 +59,16 @@ def parse_err(s):
 
 def run(v):
     label, kind, target, env, flags = v
-    with tempfile.TemporaryDirectory() as out:
+    out = tempfile.mkdtemp()
+    try:
+        return run_in(v, out)
+    finally:
+        subprocess.run(['sudo', 'rm', '-rf', out])
+
+
+def run_in(v, out):
+    label, kind, target, env, flags = v
+    if True:
         os.chmod(out, 0o777)
         if kind == 'native':
             e = dict(os.environ, DATA_DIR=data, NCPU=ncpu, OUTPUT_DIR=out, XL_TIMING='1')

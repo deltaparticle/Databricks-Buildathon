@@ -6,3 +6,5 @@ noop        docker  noop
 musl        native  ./muslbin
 glibc       native  ./lanebin
 musl_nohuge native  ./muslbin XL_NOHUGE=1
+cur_rd128   docker  cur  XL_RD=128
+cur_rd1024  docker  cur  XL_RD=1024

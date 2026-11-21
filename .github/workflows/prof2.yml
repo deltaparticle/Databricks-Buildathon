@@ -9,7 +9,7 @@ on:
       rounds:
         description: "Rounds"
         required: false
-        default: "10"
+        default: "15"
       variants:
         description: "Variants file under tools/"
         required: false
@@ -20,12 +20,13 @@ permissions:
 
 jobs:
   kern:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        thp: [madvise, always, always_b]
+        os: [ubuntu-latest, ubuntu-22.04]
+        thp: [madvise, always]
     steps:
       - uses: actions/checkout@v4
       - name: Machine
@@ -82,7 +83,7 @@ jobs:
             echo "$img vs cur: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
           done
       - name: Timing (interleaved)
-        run: python3 tools/kern.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds || '10' }} tools/${{ github.event.inputs.variants || 'kern_v1.txt' }}
+        run: python3 tools/kern.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds || '15' }} tools/${{ github.event.inputs.variants || 'kern_v1.txt' }}
       - name: perf (container, system-wide, comm pipeline)
         run: |
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
