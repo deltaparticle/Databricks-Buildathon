@@ -108,6 +108,7 @@ jobs:
             [Q6]="SHOP_Q_BITS=6" [Q8]="SHOP_Q_BITS=8"
             [C512K]="SHOP_CHUNK_KB=512" [C8M]="SHOP_CHUNK_KB=8192"
             [THP]="MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
+            [F4]="SHOP_FILTER_BITS=4" [F16]="SHOP_FILTER_BITS=16"
           )
           rm -f sweep.txt
           for i in 1 2 3; do

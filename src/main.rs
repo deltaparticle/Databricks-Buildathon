@@ -445,61 +445,54 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>, tsc: &mut ts::DateC
 /// Every linked ID that is not its person's name -> the name. A bitmap in
 /// front of the table answers most lookups (IDs that are names) from cache.
 struct Aliases {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    /// (alias ID, person name) slots, one cache miss per probe.
+    slots: Vec<(u64, u64)>,
     mask: usize,
+    /// Word-blocked filter: two bits in one 64-bit word per alias.
     filter: Vec<u64>,
-    fmask: u64,
+    wmask: usize,
 }
 
 impl Aliases {
     fn from_pairs(pairs: &[(u64, u64)]) -> Self {
         let cap = (pairs.len() * 2).next_power_of_two().max(16);
-        let fbits = (pairs.len() * 16).next_power_of_two().max(1 << 12);
-        let mut m = Aliases {
-            keys: vec![EMPTY; cap],
-            vals: vec![0; cap],
-            mask: cap - 1,
-            filter: vec![0; fbits / 64],
-            fmask: fbits as u64 - 1,
-        };
+        let bits_per_key = env_num("SHOP_FILTER_BITS", 8).max(1);
+        let words = (pairs.len() * bits_per_key / 64 + 1).next_power_of_two().max(64);
+        let mut m = Aliases { slots: vec![(EMPTY, 0); cap], mask: cap - 1, filter: vec![0; words], wmask: words - 1 };
         for &(k, v) in pairs {
             let h = mix(k);
-            let f = h & m.fmask;
-            m.filter[(f >> 6) as usize] |= 1 << (f & 63);
+            let (w, b) = Self::fbits(h, m.wmask);
+            m.filter[w] |= b;
             let mut s = h as usize & m.mask;
-            while m.keys[s] != EMPTY && m.keys[s] != k {
+            while m.slots[s].0 != EMPTY && m.slots[s].0 != k {
                 s = (s + 1) & m.mask;
             }
-            m.keys[s] = k;
-            m.vals[s] = v;
+            m.slots[s] = (k, v);
         }
         m
+    }
+    #[inline(always)]
+    fn fbits(h: u64, wmask: usize) -> (usize, u64) {
+        ((h >> 20) as usize & wmask, (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63)))
     }
     /// `h` is mix(k).
     #[inline(always)]
     fn person(&self, k: u64, h: u64) -> u64 {
-        let f = h & self.fmask;
-        if self.filter[(f >> 6) as usize] & (1 << (f & 63)) == 0 {
+        let (w, b) = Self::fbits(h, self.wmask);
+        if self.filter[w] & b != b {
             return k;
         }
         let mut s = h as usize & self.mask;
         loop {
-            let x = self.keys[s];
+            let (x, v) = self.slots[s];
             if x == k {
-                return self.vals[s];
+                return v;
             }
             if x == EMPTY {
                 return k;
             }
             s = (s + 1) & self.mask;
         }
-    }
-    #[inline(always)]
-    fn prefetch(&self, h: u64) {
-        let f = h & self.fmask;
-        prefetch(self.filter.as_ptr().wrapping_add((f >> 6) as usize));
-        prefetch(self.keys.as_ptr().wrapping_add(h as usize & self.mask));
     }
 }
 
@@ -958,9 +951,6 @@ fn bench_alias(ctx: &Ctx, data: &Path) {
         let t = Instant::now();
         let mut y = 0u64;
         for i in 0..n {
-            if i + 16 < n {
-                a.prefetch(mix(ukeys[i + 16]));
-            }
             let u = ukeys[i];
             y ^= a.person(u, mix(u));
         }
@@ -1052,7 +1042,7 @@ fn main() {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
             scope.spawn(move || readahead_all(&all));
         }
-        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.keys.iter().filter(|&&k| k != EMPTY).count()); } a });
+        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.slots.iter().filter(|x| x.0 != EMPTY).count()); } a });
         let p1 = pool(
             threads,
             n_event_chunks + click_chunks.len(),
