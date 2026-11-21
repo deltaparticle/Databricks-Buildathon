@@ -31,7 +31,7 @@ jobs:
       - name: Machine (the build targets Cascade Lake, so AVX-512 is required)
         run: |
           nproc; lscpu | grep "Model name"; free -g
-          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512vnni; do
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
             grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
           done
 
