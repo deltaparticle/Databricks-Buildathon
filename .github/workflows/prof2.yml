@@ -14,6 +14,14 @@ on:
         description: "Variants file under tools/"
         required: false
         default: "kern_v1.txt"
+      os:
+        description: "JSON list of runner images"
+        required: false
+        default: '["ubuntu-latest","ubuntu-22.04"]'
+      thp:
+        description: "JSON list of THP modes"
+        required: false
+        default: '["madvise","always"]'
       envs:
         description: "Extra env sets for the counters step (space separated, each VAR=VAL[,..])"
         required: false
@@ -29,8 +37,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
-        thp: [madvise, always]
+        os: ${{ fromJSON(github.event.inputs.os || '["ubuntu-latest","ubuntu-22.04"]') }}
+        thp: ${{ fromJSON(github.event.inputs.thp || '["madvise","always"]') }}
     steps:
       - uses: actions/checkout@v4
       - name: Machine
@@ -77,6 +85,7 @@ jobs:
           echo "== docker seccomp=unconfined"; docker run --rm $FLAGS --security-opt seccomp=unconfined diag
       - name: Counters (native musl, vmstat deltas, syscalls)
         run: |
+          set +e
           K="thp_fault_alloc thp_fault_fallback thp_split_pmd pgfault pgalloc_normal pgalloc_dma32 pgfree thp_zero_page_alloc"
           for e in "" ${{ github.event.inputs.envs || '' }}; do
             for i in 1 2; do
