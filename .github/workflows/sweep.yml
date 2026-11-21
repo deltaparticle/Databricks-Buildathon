@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [rt2, ct1, pgo]
+        part: [conf_madvise, conf_always, conf_always_b]
     steps:
       - uses: actions/checkout@v4
       - name: Machine
@@ -49,6 +49,19 @@ jobs:
           case "${{ matrix.part }}" in
             rt) cp tools/sweep_rt.txt v.txt ;;
             rt2) cp tools/sweep_rt2.txt v.txt ;;
+            conf_*)
+              # the grader (GCP n2, kernel 6.1) runs THP "always"; CI defaults to "madvise"
+              case "${{ matrix.part }}" in conf_always*) echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled ;; esac
+              cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+              build ub11 XL_UB=11
+              echo "r3_0 ./lanebin XL_R3=0" >> v.txt
+              echo "ub11_r3_0 ./bin-ub11 XL_R3=0" >> v.txt
+              pip install --quiet polars
+              for v in "./lanebin XL_R3=0" "./bin-ub11" "./bin-ub11 XL_R3=0"; do
+                a=$(mktemp -d); b=$(mktemp -d); set -- $v; bin=$1; shift
+                env "$@" DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) $bin; DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$b" NCPU=$(nproc) ./lanebin
+                echo "$v output vs base: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+              done ;;
             ct1)
               build bb14 XL_BB=14; build bb13 XL_BB=13; build ub11 XL_UB=11; build ub13 XL_UB=13
               build sub2048 XL_SUB_DEF=2048; build sub8192 XL_SUB_DEF=8192; build slab12 XL_SLABROWS=12; build slab14 XL_SLABROWS=14 ;;
