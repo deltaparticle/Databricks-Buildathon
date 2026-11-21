@@ -132,13 +132,13 @@ jobs:
             echo "$v output vs base: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"; done
           declare -A CFG=(
             [base]="./cppbin"
-            [P1_10]="env P1BITS=10 ./cppbin" [P1_12]="env P1BITS=12 ./cppbin"
-            [P2_10]="env P2BITS=10 ./cppbin" [P2_12]="env P2BITS=12 ./cppbin" [P2_9]="env P2BITS=9 ./cppbin"
-            [B32K]="env BATCH_KB=32 ./cppbin" [B128K]="env BATCH_KB=128 ./cppbin"
-            [C512K]="env CHUNK_KB=512 ./cppbin" [C2M]="env CHUNK_KB=2048 ./cppbin" [C4M]="env CHUNK_KB=4096 ./cppbin"
+            [NOAVX512]="env NOAVX512=1 ./cppbin"
+            [P1_10]="env P1BITS=10 ./cppbin" [P2_10]="env P2BITS=10 ./cppbin"
+            [2xthreads]="env NCPU=$(( $(nproc) * 2 )) ./cppbin"
+            [PIN]="env PIN=1 ./cppbin"
           )
           rm -f sweep.txt
-          for i in 1 2 3 4; do
+          for i in 1 2 3 4 5 6; do
             for name in "${!CFG[@]}"; do
               /usr/bin/time -f "$name wall=%e user=%U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ${CFG[$name]} > /dev/null 2>> sweep.txt
             done
