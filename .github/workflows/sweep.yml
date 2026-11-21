@@ -11,6 +11,14 @@ on:
         description: "Rounds per sweep"
         required: false
         default: "12"
+      parts:
+        description: "JSON list of parts"
+        required: false
+        default: '["refs_madvise", "refs_always", "refs_always_b"]'
+      refs:
+        description: "For refs_* parts: space-separated git refs to time against this commit"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -22,9 +30,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [conf_madvise, conf_always, conf_always_b]
+        part: ${{ fromJSON(github.event.inputs.parts) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Machine
         run: |
           nproc; lscpu | grep "Model name"
@@ -49,6 +59,18 @@ jobs:
           case "${{ matrix.part }}" in
             rt) cp tools/sweep_rt.txt v.txt ;;
             rt2) cp tools/sweep_rt2.txt v.txt ;;
+            refs_*)
+              case "${{ matrix.part }}" in *always*) echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled ;; esac
+              cat /sys/kernel/mm/transparent_hugepage/enabled
+              pip install --quiet polars
+              for r in ${{ github.event.inputs.refs }}; do
+                git fetch -q origin "$r" && git worktree add -q "/tmp/w-$r" FETCH_HEAD
+                lab=$(printf '%s' "$r" | tr -c 'a-zA-Z0-9_' '_')
+                (cd "/tmp/w-$r/lane" && CARGO_TARGET_DIR=/tmp/t-$lab cargo build --release -q) && cp /tmp/t-$lab/release/pipeline ./bin-$lab && echo "$lab ./bin-$lab" >> v.txt
+                a=$(mktemp -d); b=$(mktemp -d)
+                DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) ./bin-$lab; DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$b" NCPU=$(nproc) ./lanebin
+                echo "$lab output vs base: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+              done ;;
             conf_*)
               # the grader (GCP n2, kernel 6.1) runs THP "always"; CI defaults to "madvise"
               case "${{ matrix.part }}" in conf_always*) echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled ;; esac
