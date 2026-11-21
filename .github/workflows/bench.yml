@@ -119,6 +119,9 @@ jobs:
               echo "$out" > "last_$name"
             done
           done
+          echo "== per-phase timings"
+          env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 $DX 2>&1 >/dev/null | tail -30
+          env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 $US 2>&1 >/dev/null | tail -12
           grep -E "^(ours|eagle|dremix) wall" comp.txt
           python3 - <<'PY'
           import statistics as st, collections, glob, polars as pl
