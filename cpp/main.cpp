@@ -3025,8 +3025,7 @@ int main(int argc, char** argv) {
   if (VERBOSE) {
     double a = 0, b = 0;
     for (auto* tc : g_tc) a += tc->p2a, b += tc->p2b;
-    fprintf(stderr, "            phase 2 per thread: pass 1 %.1f ms, pass 2 %.1f ms
-", a / NT, b / NT);
+    fprintf(stderr, "            phase 2 per thread: pass 1 %.1f ms, pass 2 %.1f ms\n", a / NT, b / NT);
   }
   const size_t NAGG = (size_t)(NCAMP + 1) * ND;
   auto phase3_buffers = [&](TC& tc) {
@@ -3078,8 +3077,7 @@ int main(int argc, char** argv) {
         std::swap(tc->cks, tc->cks2);
       }
     }
-    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: clicks placed
-", now_ms());
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: clicks placed\n", now_ms());
     u64 vend = 0, wend = 0;
     for (auto* tc : g_tc) vend = std::max(vend, tc->vmax + 1), wend = std::max(wend, tc->wmax + 1);
     // Runs, range by range.
@@ -3100,12 +3098,10 @@ int main(int argc, char** argv) {
       });
     }
     vector<DRun> eruns, cruns;
-    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs
-", now_ms());
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs\n", now_ms());
     join_runs(er, eruns, false), join_runs(crr, cruns, true);
     er.clear(), crr.clear();
-    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs joined
-", now_ms());
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs joined\n", now_ms());
     // Count each person's runs; people with rows in the general partitions are flagged.
     g_ptcap = std::max<u64>(1024, (eruns.size() + cruns.size()) * 2);
     g_pt = (PSlot*)big_alloc(g_ptcap * sizeof(PSlot));
@@ -3147,8 +3143,7 @@ int main(int argc, char** argv) {
         (void)tc;
       });
     }
-    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: people counted
-", now_ms());
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: people counted\n", now_ms());
     // Sessionize the simple people; send the others' rows to the general partitions.
     {
       std::atomic<size_t> next{0};
