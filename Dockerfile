@@ -11,6 +11,6 @@ RUN g++ -O3 -march=x86-64-v3 -mtune=skylake-avx512 -std=c++20 -pthread -static -
 
 FROM scratch
 COPY --from=build /sessions /sessions
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8
+ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 NOHUGE=1
 USER 1000:1000
 CMD ["/sessions"]
