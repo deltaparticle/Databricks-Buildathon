@@ -2923,7 +2923,7 @@ int main(int argc, char** argv) {
       g_vsh = 0;
       while (((g_nv - 1) >> g_vsh) >= P1) g_vsh++;
       g_dev = true;
-      g_ntgt = 1;  // sample clicks for the click key
+      g_ntgt = getenv("DENSEWALK") ? 1 : 0;  // sample clicks for the click key (the dense walk only)
     }
     if (VERBOSE) fprintf(stderr, "[%8.1f ms] event key %s: %zu samples, %zu pairs, nv %llu, range %u\n", now_ms(), g_dev ? "ok" : "no", all.size(), ep.size(), (unsigned long long)g_nv, 1u << g_vsh);
   }
@@ -3020,7 +3020,7 @@ int main(int argc, char** argv) {
   }
 
   // ---- dense indices: the click key from the samples
-  if (g_dev) {
+  if (g_dev && g_ntgt) {
     vector<TC::Samp> es, cs;
     for (auto* tc : g_tc) es.insert(es.end(), tc->esamp.begin(), tc->esamp.end()), cs.insert(cs.end(), tc->csamp.begin(), tc->csamp.end());
     auto byut = [](const TC::Samp& x, const TC::Samp& y) { return x.uid != y.uid ? x.uid < y.uid : x.ts != y.ts ? x.ts < y.ts : x.id < y.id; };
