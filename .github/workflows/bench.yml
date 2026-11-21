@@ -118,45 +118,6 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
-      - name: Sweep run-time switches and compiler variants (round-robin, same machine)
-        run: |
-          F="-O3 -march=x86-64-v3 -mtune=skylake-avx512 -std=c++20 -pthread"
-          g++ $F -flto -o /tmp/v_lto cpp/main.cpp cpp/fallback.cpp
-          rm -rf /tmp/pgo && mkdir -p /tmp/pgo
-          g++ $F -fprofile-generate -fprofile-update=atomic -fprofile-dir=/tmp/pgo -o /tmp/v_gen cpp/main.cpp cpp/fallback.cpp
-          for d in dev dev; do DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) /tmp/v_gen; done
-          g++ $F -fprofile-use -fprofile-partial-training -fprofile-dir=/tmp/pgo -Wno-missing-profile -o /tmp/v_pgo cpp/main.cpp cpp/fallback.cpp
-          g++ $F -flto -fprofile-use -fprofile-partial-training -fprofile-dir=/tmp/pgo -Wno-missing-profile -o /tmp/v_pgolto cpp/main.cpp cpp/fallback.cpp
-          for v in v_lto v_pgo v_pgolto; do a=$(mktemp -d); b=$(mktemp -d)
-            DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) /tmp/$v; DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$b" NCPU=$(nproc) ./cppbin
-            echo "$v output vs base: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"; done
-          declare -A CFG=(
-            [base]="./cppbin"
-            [NOAVX512]="env NOAVX512=1 ./cppbin"
-            [P1_10]="env P1BITS=10 ./cppbin" [P2_10]="env P2BITS=10 ./cppbin"
-            [2xthreads]="env NCPU=$(( $(nproc) * 2 )) ./cppbin"
-            [PIN]="env PIN=1 ./cppbin"
-          )
-          rm -f sweep.txt
-          for i in 1 2 3 4 5 6; do
-            for name in "${!CFG[@]}"; do
-              /usr/bin/time -f "$name wall=%e user=%U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ${CFG[$name]} > /dev/null 2>> sweep.txt
-            done
-          done
-          python3 - <<'PY'
-          import statistics as st, collections
-          d = collections.defaultdict(lambda: ([], []))
-          for l in open("sweep.txt"):
-              p = l.split()
-              if len(p) == 3 and p[1].startswith("wall="):
-                  d[p[0]][0].append(float(p[1][5:])); d[p[0]][1].append(float(p[2][5:]))
-          base = st.median(d["base"][0])
-          for k, (w, u) in sorted(d.items(), key=lambda kv: st.median(kv[1][0])):
-              print(f"{k:10s} median wall {st.median(w):.3f}s ({(st.median(w)/base-1)*100:+.1f}%)  user {st.median(u):.2f}s  n={len(w)}")
-          PY
-          echo "== phases (VERBOSE)"
-          env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 ./cppbin 2>&1 >/dev/null | tail -14
-
       - name: perf profile of the shipped C++ pipeline
         run: |
           sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
@@ -167,4 +128,10 @@ jobs:
           echo "===== top symbols (self)"
           $PERF report -i perf.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -40
           echo "===== top source lines"
-          $PERF report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -60
+          $PERF report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -150
+          for fn in phase3_partition do_person forward_run phase2_partition stage2_events fast_event; do
+            echo "===== lines in $fn"
+            $PERF report -i perf.data --no-children --symbol-filter=$fn --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -25
+          done
+          echo "===== perf stat"
+          $PERF stat -e task-clock,page-faults,context-switches,cpu-migrations env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./cppbin 2>&1 | tail -10
