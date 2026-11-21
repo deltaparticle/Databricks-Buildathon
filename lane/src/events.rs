@@ -319,7 +319,7 @@ unsafe fn scatter_chunk12(p: *const u8, n: usize, slots: *mut Rec, gen: u64, nex
     let mut i = 0usize;
     while i + 4 <= n {
         if PF_CHUNK {
-            _mm_prefetch::<_MM_HINT_T0>(nextc.wrapping_add(i * 12));
+            ckpf(nextc.wrapping_add(i * 12));
         }
         if SPF > 0 {
             pre(i + SPF);
@@ -423,6 +423,17 @@ unsafe fn sr_drain(buf: *mut u8, cnt: &mut [u32; SRP], slots: *mut Rec, gen: u64
             sr_flush(buf.add(part * SRCAP * 16), c, slots, gen);
             cnt[part] = 0;
         }
+    }
+}
+// Hint of the next-chunk prefetch in scatter_chunk12: 0 T0 (shipped), 1 T1, 2 T2, 3 NTA.
+const CKH: u32 = crate::env_u32(option_env!("XL_CKH"), 0);
+#[inline(always)]
+unsafe fn ckpf(a: *const i8) {
+    match CKH {
+        1 => _mm_prefetch::<_MM_HINT_T1>(a),
+        2 => _mm_prefetch::<_MM_HINT_T2>(a),
+        3 => _mm_prefetch::<_MM_HINT_NTA>(a),
+        _ => _mm_prefetch::<_MM_HINT_T0>(a),
     }
 }
 const SPF: usize = crate::env_u32(option_env!("XL_SPF"), 0) as usize;
