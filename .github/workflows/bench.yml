@@ -100,6 +100,23 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
+      - name: Cold page cache (drop caches before each run)
+        run: |
+          drop() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
+          BIG=$(ls -S "$RUNNER_TEMP/p20/events"/*.csv | head -1)
+          drop; echo "sequential read of one file: $( { /usr/bin/time -f %e dd if="$BIG" of=/dev/null bs=8M 2>&1 >/dev/null; } | tail -1 )s for $(du -m "$BIG" | cut -f1) MB"
+          drop; s=$(date +%s.%N); find "$RUNNER_TEMP/p20" -name '*.csv' -print0 | xargs -0 -P 16 -n 4 cat > /dev/null; e=$(date +%s.%N)
+          echo "parallel cat of all 1.9 GB (16 readers): $(python3 -c "print(round($e-$s,3))")s"
+          for i in 1 2 3; do
+            drop
+            /usr/bin/time -f "COLD wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "COLD|s (parse|dedup|sessions|write)$|links built" | tr '
+' ' '; echo
+          done
+          for i in 1 2; do
+            /usr/bin/time -f "WARM wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "WARM|s (parse|dedup|sessions|write)$" | tr '
+' ' '; echo
+          done
+
       - name: PGO A/B (profile-guided build vs normal build of this commit)
         run: |
           rustup component add llvm-tools >/dev/null 2>&1 || rustup component add llvm-tools-preview
