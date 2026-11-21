@@ -482,13 +482,54 @@ impl Aliases {
 }
 
 /// Union-find over the links: the byte-wise smallest ID names each person.
+///
+/// Link lines are scanned with the SIMD scanner into key pairs; each ID gets a
+/// slot in one open-addressing table (indexed by multiply-high, so its size
+/// need not be a power of two) and union-find runs directly over slot numbers.
+/// Lookups are prefetched a batch ahead, since the table is far bigger than
+/// cache.
 fn build_aliases(paths: &[PathBuf]) -> Aliases {
-    let bytes: usize = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum();
-    // A link line is ~21 bytes and names two IDs; most IDs appear in ~1.2 lines.
-    let expect = bytes / 12 + 1024;
-    let mut index = SmallIndex::new(expect * 2);
-    let mut ids: Vec<u64> = Vec::with_capacity(expect);
-    let mut parent: Vec<u32> = Vec::with_capacity(expect);
+    let t_start = Instant::now();
+    let maps = map_files(paths);
+    let bytes: usize = maps.iter().map(|m| m.len()).sum();
+    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(bytes / 18 + 16);
+    for m in &maps {
+        csv::scan::<2>(body(m), |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                pairs.push((keys::key(f[0]), keys::key(f[1])));
+            }
+        });
+    }
+    let t_parse = t_start.elapsed().as_secs_f64();
+
+    // At most two new IDs per pair; ~2.5 slots per expected ID keeps probes short.
+    let cap = (pairs.len() * 3).max(64);
+    let mut slot_key = vec![EMPTY; cap];
+    let mut parent = vec![NONE; cap];
+    #[inline(always)]
+    fn home(k: u64, cap: usize) -> usize {
+        ((mix(k) as u128 * cap as u128) >> 64) as usize
+    }
+    #[inline(always)]
+    fn slot_of(slot_key: &mut [u64], parent: &mut [u32], k: u64, cap: usize) -> u32 {
+        let mut s = home(k, cap);
+        loop {
+            let x = slot_key[s];
+            if x == k {
+                return s as u32;
+            }
+            if x == EMPTY {
+                slot_key[s] = k;
+                parent[s] = s as u32;
+                return s as u32;
+            }
+            s += 1;
+            if s == cap {
+                s = 0;
+            }
+        }
+    }
+    #[inline(always)]
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let gp = parent[parent[x as usize] as usize];
@@ -497,52 +538,71 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
         }
         x
     }
-    for path in paths {
-        let data = std::fs::read(path).expect("read links");
-        csv::for_lines(body(&data), |line| {
-            let mut f = [&b""[..]; 2];
-            if !csv::split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                return;
-            }
-            let mut id_of = |k: u64| -> u32 {
-                let (i, new) = index.get_or_insert(k, ids.len() as u32);
-                if new {
-                    ids.push(k);
-                    parent.push(i);
-                }
-                i
-            };
-            let a = id_of(keys::key(f[0]));
-            let b = id_of(keys::key(f[1]));
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                parent[ra as usize] = rb;
-            }
-        });
+    const AHEAD: usize = 16;
+    for i in 0..pairs.len() {
+        if i + AHEAD < pairs.len() {
+            let (a, b) = pairs[i + AHEAD];
+            prefetch(slot_key.as_ptr().wrapping_add(home(a, cap)));
+            prefetch(slot_key.as_ptr().wrapping_add(home(b, cap)));
+        }
+        let (a, b) = pairs[i];
+        let sa = slot_of(&mut slot_key, &mut parent, a, cap);
+        let sb = slot_of(&mut slot_key, &mut parent, b, cap);
+        let ra = find(&mut parent, sa);
+        let rb = find(&mut parent, sb);
+        if ra != rb {
+            parent[ra as usize] = rb;
+        }
     }
-    let t_uf = Instant::now();
-    let n = ids.len();
-    let mut best = vec![EMPTY; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        let k = ids[i];
+    let t_union = t_start.elapsed().as_secs_f64();
+
+    // Smallest ID (byte order) per root, then every non-name ID -> its name.
+    // First compress every slot straight to its root; the next passes read
+    // roots in slot order, so their random accesses can be prefetched.
+    for s in 0..cap {
+        if slot_key[s] != EMPTY {
+            let r = find(&mut parent, s as u32);
+            parent[s] = r;
+        }
+    }
+    let mut best = vec![EMPTY; cap];
+    for s in 0..cap {
+        if s + AHEAD < cap && parent[s + AHEAD] != NONE {
+            prefetch(best.as_ptr().wrapping_add(parent[s + AHEAD] as usize));
+        }
+        let k = slot_key[s];
+        if k == EMPTY {
+            continue;
+        }
+        let r = parent[s] as usize;
         if best[r] == EMPTY || keys::cmp(k, best[r]).is_lt() {
             best[r] = k;
         }
     }
-    let mut pairs = Vec::with_capacity(n);
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        if best[r] != ids[i] {
-            pairs.push((ids[i], best[r]));
+    let mut alias_pairs = Vec::with_capacity(pairs.len());
+    for s in 0..cap {
+        if s + AHEAD < cap && parent[s + AHEAD] != NONE {
+            prefetch(best.as_ptr().wrapping_add(parent[s + AHEAD] as usize));
+        }
+        let k = slot_key[s];
+        if k == EMPTY {
+            continue;
+        }
+        let name = best[parent[s] as usize];
+        if name != k {
+            alias_pairs.push((k, name));
         }
     }
-    let t_pairs = t_uf.elapsed().as_secs_f64();
-    let t = Instant::now();
-    let a = Aliases::from_pairs(&pairs);
+    let t_best = t_start.elapsed().as_secs_f64();
+    let a = Aliases::from_pairs(&alias_pairs);
     if std::env::var_os("SHOP_PROFILE").is_some() {
-        eprintln!("links: parse+union until {:.3}s, best/pairs {:.3}s, table {:.3}s", T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64()) - t_pairs - t.elapsed().as_secs_f64(), t_pairs, t.elapsed().as_secs_f64());
+        eprintln!(
+            "links: parse {:.3}s, union {:.3}s, names {:.3}s, table {:.3}s",
+            t_parse,
+            t_union - t_parse,
+            t_best - t_union,
+            t_start.elapsed().as_secs_f64() - t_best
+        );
     }
     a
 }
