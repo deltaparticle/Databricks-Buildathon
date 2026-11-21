@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::Instant;
 
+use memmap2::Mmap;
 use mimalloc::MiMalloc;
 
 use ts::DAY;
@@ -219,129 +220,49 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// An input CSV read with positioned reads (no mmap: no page-fault storm).
-struct InFile {
-    file: std::fs::File,
-    len: usize,
-    /// Offset of the first data line (just after the header line).
-    body: usize,
+/// Memory-map every non-empty file. Mapping lets the scanner read the OS
+/// page cache directly: no copy into a buffer that would fall out of L2.
+fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let f = std::fs::File::open(p).expect("open input");
+            if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                return None;
+            }
+            Some(unsafe { Mmap::map(&f).expect("mmap input") })
+        })
+        .collect()
 }
 
-#[inline]
-fn read_at(file: &std::fs::File, buf: &mut [u8], mut off: u64) -> usize {
-    let mut done = 0;
-    while done < buf.len() {
-        #[cfg(unix)]
-        let r = std::os::unix::fs::FileExt::read_at(file, &mut buf[done..], off);
-        #[cfg(windows)]
-        let r = std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], off);
-        match r {
-            Ok(0) => break,
-            Ok(n) => {
-                done += n;
-                off += n as u64;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => panic!("read input: {e}"),
-        }
-    }
-    done
-}
-
-fn open_files(paths: &[PathBuf]) -> Vec<InFile> {
-    let mut out = Vec::new();
-    for p in paths {
-        let file = std::fs::File::open(p).expect("open input");
-        let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-        if len == 0 {
-            continue;
-        }
-        let mut body = len;
-        let mut buf = vec![0u8; 4096];
-        let mut off = 0;
-        while off < len {
-            let n = read_at(&file, &mut buf, off as u64);
-            if n == 0 {
-                break;
-            }
-            if let Some(i) = memchr::memchr(b'\n', &buf[..n]) {
-                body = off + i + 1;
-                break;
-            }
-            off += n;
-        }
-        out.push(InFile { file, len, body });
-    }
-    out
-}
-
-/// Start the kernel reading every file now (cold page cache).
+/// Start the kernel reading every mapping now, in order (cold page cache).
 #[cfg(unix)]
-fn fadvise_all(files: &[&InFile]) {
-    use std::os::unix::io::AsRawFd;
-    for f in files {
-        unsafe {
-            libc::posix_fadvise(f.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-            libc::posix_fadvise(f.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
-        }
+fn readahead_all(maps: &[&Mmap]) {
+    for m in maps {
+        let _ = m.advise(memmap2::Advice::Sequential);
+        let _ = m.advise(memmap2::Advice::WillNeed);
     }
 }
 
-/// Byte ranges (file index, start, end) of every body; a range owns the lines
-/// that start inside it.
-fn chunks(files: &[InFile]) -> Vec<(usize, usize, usize)> {
+/// Newline-aligned byte ranges (file index, start, end) of every body.
+fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
-    for (fi, f) in files.iter().enumerate() {
-        let mut pos = f.body;
-        while pos < f.len {
-            let end = (pos + CHUNK).min(f.len);
+    for (fi, m) in maps.iter().enumerate() {
+        let len = m.len();
+        let mut pos = len - body(m).len();
+        while pos < len {
+            let mut end = (pos + CHUNK).min(len);
+            if end < len {
+                end = match memchr::memchr(b'\n', &m[end..]) {
+                    Some(i) => end + i + 1,
+                    None => len,
+                };
+            }
             out.push((fi, pos, end));
             pos = end;
         }
     }
     out
-}
-
-/// Read the lines starting in [start, end) into `buf`; returns them as a slice.
-fn load_chunk<'a>(f: &InFile, start: usize, end: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
-    let from = if start > f.body { start - 1 } else { start };
-    let n = end - from;
-    if buf.len() < n + 4096 {
-        buf.resize(n + 4096, 0);
-    }
-    let got = read_at(&f.file, &mut buf[..n], from as u64);
-    let first = if from == start {
-        0
-    } else {
-        match memchr::memchr(b'\n', &buf[..got]) {
-            Some(i) => i + 1,
-            None => return &[],
-        }
-    };
-    let mut stop = got;
-    if got > 0 && buf[got - 1] != b'\n' && end < f.len {
-        // Finish the last line from the following bytes.
-        let mut off = end;
-        loop {
-            if buf.len() < stop + 4096 {
-                buf.resize(stop + 4096, 0);
-            }
-            let m = read_at(&f.file, &mut buf[stop..stop + 4096], off as u64);
-            if m == 0 {
-                break;
-            }
-            if let Some(i) = memchr::memchr(b'\n', &buf[stop..stop + m]) {
-                stop += i + 1;
-                break;
-            }
-            stop += m;
-            off += m;
-        }
-    }
-    if first >= stop {
-        return &[];
-    }
-    &buf[first..stop]
 }
 
 /// The data lines of a file: everything after the header line.
@@ -704,7 +625,6 @@ impl SmallIndex {
 }
 
 struct P1 {
-    buf: Vec<u8>,
     ev: Vec<Vec<Ev>>,
     cl: Vec<Cl>,
 }
@@ -957,14 +877,14 @@ fn main() {
         bench_parse(&ctx, &path);
         return;
     }
-    let event_files = open_files(&list_csv(&data.join("events")));
-    let click_files = open_files(&list_csv(&data.join("clicks")));
+    let event_files = map_files(&list_csv(&data.join("events")));
+    let click_files = map_files(&list_csv(&data.join("clicks")));
     let link_paths = list_csv(&data.join("links"));
     let event_chunks = chunks(&event_files);
     let click_chunks = chunks(&click_files);
     let n_event_chunks = event_chunks.len();
-    let event_bytes: usize = event_files.iter().map(|f| f.len).sum();
-    let click_bytes: usize = click_files.iter().map(|f| f.len).sum();
+    let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
+    let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
     // Rows are ~78 (events) and ~47 (clicks) bytes; reserve with headroom.
     let est_events = event_bytes / 70 + 1024;
     let est_clicks = click_bytes / 40 + 1024;
@@ -974,26 +894,25 @@ fn main() {
     let (p1, aliases) = thread::scope(|scope| {
         #[cfg(unix)]
         {
-            let all: Vec<&InFile> = event_files.iter().chain(click_files.iter()).collect();
-            scope.spawn(move || fadvise_all(&all));
+            let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
+            scope.spawn(move || readahead_all(&all));
         }
         let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.keys.iter().filter(|&&k| k != EMPTY).count()); } a });
         let p1 = pool(
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
-                buf: vec![0u8; CHUNK + 8192],
                 ev: (0..P).map(|_| Vec::with_capacity(est_events / threads / P * 5 / 4)).collect(),
                 cl: Vec::with_capacity(est_clicks / threads * 5 / 4),
             },
             |st, t| {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
-                    let slice = load_chunk(&event_files[fi], a, b, &mut st.buf);
+                    let slice = &event_files[fi][a..b];
                     csv::scan::<7>(slice, |f| parse_event(f, &ctx, &mut st.ev));
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
-                    let slice = load_chunk(&click_files[fi], a, b, &mut st.buf);
+                    let slice = &click_files[fi][a..b];
                     csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl));
                 }
             },
