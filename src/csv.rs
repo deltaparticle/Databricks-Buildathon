@@ -147,30 +147,38 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
             tail[..len - base].copy_from_slice(&data[base..]);
             &tail
         };
-        let (nl, cm, mut qt) = masks(block);
-        let mut seps = nl | cm;
-        while seps != 0 {
-            let bit = seps & seps.wrapping_neg();
-            let pos = base + bit.trailing_zeros() as usize;
-            if nl & bit != 0 {
-                let below = qt & (bit - 1);
-                quotes += below.count_ones();
-                qt &= !below;
-                finish(line_start, pos, &commas, nc, quotes);
-                line_start = pos + 1;
-                nc = 0;
-                quotes = 0;
-            } else {
-                if nc < N {
-                    commas[nc] = pos;
-                }
-                nc += 1;
-                if nc > N {
-                    nc = N;
-                }
+        let (mut nl, mut cm, mut qt) = masks(block);
+        // Commas of the current line in `c`: record them, or mark the line bad
+        // (nc = N) if it would have more than N-1.
+        #[inline(always)]
+        fn add_commas<const N: usize>(c: u64, base: usize, commas: &mut [usize; N], nc: &mut usize) {
+            let cnt = c.count_ones() as usize;
+            if *nc + cnt > N - 1 {
+                *nc = N;
+                return;
             }
-            seps ^= bit;
+            let mut m = c;
+            while m != 0 {
+                commas[*nc] = base + m.trailing_zeros() as usize;
+                *nc += 1;
+                m &= m - 1;
+            }
         }
+        while nl != 0 {
+            let bit = nl & nl.wrapping_neg();
+            let below = bit - 1;
+            add_commas(cm & below, base, &mut commas, &mut nc);
+            quotes += (qt & below).count_ones();
+            cm &= !below;
+            qt &= !below;
+            let pos = base + bit.trailing_zeros() as usize;
+            finish(line_start, pos, &commas, nc, quotes);
+            line_start = pos + 1;
+            nc = 0;
+            quotes = 0;
+            nl ^= bit;
+        }
+        add_commas(cm, base, &mut commas, &mut nc);
         quotes += qt.count_ones();
         base += 64;
     }

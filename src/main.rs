@@ -891,6 +891,46 @@ impl P3 {
     }
 }
 
+/// Single-threaded, in-memory parse benchmark (no I/O): ns per line.
+fn bench_parse(ctx: &Ctx, path: &str) {
+    let mut data = std::fs::read(path).expect("bench file");
+    data.truncate(200 << 20);
+    let cut = data.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+    data.truncate(cut);
+    let body = body(&data);
+    let lines = memchr::memchr_iter(b'\n', body).count();
+    for round in 0..6 {
+        let t = Instant::now();
+        let mut n = 0usize;
+        csv::scan::<7>(body, |f| n += f[6].len());
+        let scan = t.elapsed().as_secs_f64();
+        let mut b = Scatter0::new();
+        let t = Instant::now();
+        csv::scan::<7>(body, |f| parse_event(f, ctx, &mut b.0));
+        let full = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut x = 0i64;
+        csv::scan::<7>(body, |f| x ^= ts::parse(f[2]).unwrap_or(0) ^ ts::parse(f[3]).unwrap_or(0));
+        let tsp = t.elapsed().as_secs_f64() - scan;
+        let t = Instant::now();
+        let mut y = 0u64;
+        csv::scan::<7>(body, |f| y ^= keys::key(f[0]) ^ keys::key(f[1]));
+        let kp = t.elapsed().as_secs_f64() - scan;
+        let ns = |s: f64| s * 1e9 / lines as f64;
+        eprintln!(
+            "round {round}: {lines} lines  scan {:.1} ns/line  full {:.1}  (2 ts {:.1}, 2 keys {:.1})  [{} {} {}]",
+            ns(scan), ns(full), ns(tsp), ns(kp), n & 1, x & 1, y & 1
+        );
+    }
+}
+
+struct Scatter0(Vec<Vec<Ev>>);
+impl Scatter0 {
+    fn new() -> Self {
+        Scatter0((0..P).map(|_| Vec::new()).collect())
+    }
+}
+
 fn main() {
     let t0 = Instant::now();
     let _ = T0.set(t0);
@@ -909,6 +949,10 @@ fn main() {
         .unwrap_or_else(|| thread::available_parallelism().map_or(8, usize::from));
 
     let ctx = load_ctx(&data);
+    if let Ok(path) = std::env::var("SHOP_BENCH_PARSE") {
+        bench_parse(&ctx, &path);
+        return;
+    }
     let event_files = open_files(&list_csv(&data.join("events")));
     let click_files = open_files(&list_csv(&data.join("clicks")));
     let link_paths = list_csv(&data.join("links"));
