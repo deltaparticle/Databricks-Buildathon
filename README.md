@@ -2,7 +2,7 @@
 
 **Shipped pipeline (`cpp/`, built by the Dockerfile):** a C++ pipeline adapted from
 [Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)
-(commit `8452f3a`), reused under the organizers' open-reuse policy for this buildathon.
+(commit `1fe68bc`; earlier `8452f3a`), reused under the organizers' open-reuse policy for this buildathon.
 All credit for its design goes to its author; our changes on top of it are in this
 repository's history.
 

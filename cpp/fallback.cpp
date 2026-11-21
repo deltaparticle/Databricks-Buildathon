@@ -1,4 +1,4 @@
-// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 8452f3a,
+// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 1fe68bc,
 // src/fallback.cpp), used under the organizers' open-reuse policy for this buildathon.
 // Generic (slow, fully general) pipeline. Used only when the fast path in
 // main.cpp meets an input it cannot represent exactly.
@@ -589,7 +589,7 @@ static void write_parquet(const string& path, vector<PCol>& cols, i64 nrows) {
   m.i64f(2, total);
   m.i64f(3, nrows);
   m.list_end_elem();
-  m.strf(6, "sessions-cpp");
+  m.strf(6, "sessions-cpp 2.4 (build 0d365338c9c2)");
   m.byte(0);
   app(m.b.data(), m.b.size());
   u32 ml = (u32)m.b.size();

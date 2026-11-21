@@ -1,6 +1,6 @@
-// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 8452f3a,
+// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 1fe68bc,
 // src/main.cpp), used under the organizers' open-reuse policy for this buildathon.
-// Shopping Sessions: fast path.
+// Fast path.
 //
 //   phase 1  SIMD-indexed CSV parse. Events become 32-byte records scattered
 //            by hash(event_id); clicks become 24-byte records scattered by
@@ -63,7 +63,10 @@ static const i64 DAYMS = 86400000;
 static const u32 GAP_MS = 1800000;
 static const u32 SEVEN_MS = 604800000;
 static const u32 TS_INVALID = 0xFFFFFFFFu;
-static const i64 INGEST_BIAS = (i64)1 << 31;
+// ingest_ts is kept as a key that orders like the time itself: the UTC day
+// counted from 64 days before the window's first day, then HHMMSS as six
+// decimal digits of four bits each.
+static const i64 INGEST_DAY_BIAS = 64;
 
 static int NT = 8;
 static bool VERBOSE = false;
@@ -311,6 +314,13 @@ static inline bool parse_price(const char* p, u32 n, u32& out) {  // digits, 1..
 }
 
 // ---------------------------------------------------------------- fast time
+// The date of each UTC day the window touches, as text, for comparing with ingest_ts.
+struct DayStr {
+  u64 k0;   // "YYYY-MM-"
+  u32 ddt;  // "DDT"
+  u32 pad;
+};
+static DayStr* g_daystr = nullptr;
 // The dates near the window, keyed by their 11 bytes "YYYY-MM-DDT". A
 // timestamp on any other date goes to the generic parser.
 struct DateEnt {
@@ -349,6 +359,11 @@ static void init_dates() {
     k.k1 = load32(b + 8) & 0xFFFFFF;
     k.base = day * 86400 - WS / 1000;
     ks.push_back(k);
+  }
+  g_daystr = (DayStr*)calloc((size_t)ND + 1, sizeof(DayStr));
+  for (auto& k : ks) {
+    i64 d = (k.base + WS / 1000) / 86400 - DAY0;  // k.base counts from WS; back to a day number
+    if (d >= 0 && d < ND) g_daystr[d].k0 = k.k0, g_daystr[d].ddt = k.k1;
   }
   u64 seed = 0x9E3779B97F4A7C15ull;
   for (int attempt = 0; attempt < 100000; attempt++) {
@@ -394,6 +409,24 @@ static AINLINE bool f2_core(const char* p, i64& rel_sec) {
   if (UNLIKELY((bad != 0) | (oh > 23) | ((sign != '+') & (sign != '-')))) return false;
   i64 off = (i64)(oh * 60 + om) * 60;
   rel_sec = sign == '-' ? rs + off : rs - off;
+  return true;
+}
+// x: "HH:MM:SS" already XORed to digit values. Returns HHMMSS, four bits a digit.
+static AINLINE u32 bcd6(u64 x) {
+#if defined(__BMI2__)
+  return (u32)_pext_u64(__builtin_bswap64(x), 0x0F0F000F0F000F0Full);
+#else
+  return (u32)(((x & 0xF) << 20) | (((x >> 8) & 0xF) << 16) | (((x >> 24) & 0xF) << 12) | (((x >> 32) & 0xF) << 8) | (((x >> 48) & 0xF) << 4) | ((x >> 56) & 0xF));
+#endif
+}
+// The key for an ingest time given in epoch ms. False when it cannot be held exactly.
+static bool ingest_key(i64 ms, u32& key) {
+  if (ms < 0 || ms == TS_HUGE || ms % 1000 != 0) return false;
+  i64 day = ms / DAYMS - DAY0 + INGEST_DAY_BIAS;
+  if (day < 0 || day > 127) return false;
+  u32 sod = (u32)((ms % DAYMS) / 1000);
+  u32 h = sod / 3600, m = sod / 60 % 60, sc = sod % 60;
+  key = (u32)day << 24 | (h / 10) << 20 | (h % 10) << 16 | (m / 10) << 12 | (m % 10) << 8 | (sc / 10) << 4 | (sc % 10);
   return true;
 }
 static AINLINE u32 p8(u64 v) {  // 8 digit values, byte 0 most significant
@@ -471,7 +504,53 @@ struct ShortMap {
     return true;
   }
 };
+// IDs that are a fixed prefix and a decimal number with no leading zero (the
+// shape of every product and campaign the generator writes) are also kept in
+// an array indexed by the number, which is exact for that shape and much
+// cheaper than hashing. Any other ID uses the ShortMap.
+struct NumMap {
+  static constexpr u32 LIMIT = 1u << 20;
+  u32* a = nullptr;  // value + 1, 0 when absent
+  u64 pfx = 0;       // the prefix bytes
+  u32 plen = 0;
+  void init(const char* prefix) {
+    plen = (u32)strlen(prefix);
+    memcpy(&pfx, prefix, plen);
+    a = (u32*)calloc(LIMIT, sizeof(u32));
+  }
+  // The number when the ID has the shape and is below LIMIT. p must be readable for 16 bytes.
+  AINLINE bool number(const char* p, u32 n, u32& num) const {
+    const u32 k = n - plen;  // digits
+    if (UNLIKELY(k - 1 > 6u || ((load64(p) ^ pfx) & LENMASK[plen]) != 0)) return false;
+    const u64 x = (load64(p + plen) ^ 0x3030303030303030ull) & LENMASK[k];
+    if (UNLIKELY((((x + 0x0606060606060606ull) | x) & 0xF0F0F0F0F0F0F0F0ull) != 0)) return false;
+    if (UNLIKELY((x & 0xFF) == 0 && k != 1)) return false;  // a leading zero: another ID
+    u64 v = x << (8 * (8 - k));  // digits end at byte 7, zeros before them
+    v = (v * 10) + (v >> 8);
+    v = (((v & 0x000000FF000000FFull) * 0x000F424000000064ull) + (((v >> 16) & 0x000000FF000000FFull) * 0x0000271000000001ull)) >> 32;
+    num = (u32)v;
+    return num < LIMIT;
+  }
+  void insert(const char* p, u32 n, u32 val) {  // p need not be padded
+    char b[24] = {0};
+    if (n > 16) return;
+    memcpy(b, p, n);
+    u32 num;
+    if (number(b, n, num) && !a[num]) a[num] = val + 1;
+  }
+};
 static ShortMap g_prod, g_camp;
+static NumMap g_prodn, g_campn;
+// Looks an ID up in both. p must be readable for 16 bytes.
+static AINLINE bool find_id(const NumMap& nm, const ShortMap& sm, const char* p, u32 n, u32& val) {
+  u32 num;
+  if (LIKELY(nm.number(p, n, num))) {
+    const u32 v = nm.a[num];
+    if (v) val = v - 1;  // val is left alone when the ID is unknown, as ShortMap::find does
+    return v != 0;
+  }
+  return sm.find(p, n, val);
+}
 static vector<string> g_cat_names;  // sorted byte-wise; the index is the rank
 static u32 NCAT, UNKNOWN_CAT;
 static vector<string> g_camp_id, g_camp_chan;
@@ -484,15 +563,6 @@ struct IdSlot {
 static IdSlot* g_ids = nullptr;
 static u64 g_idcap = 0;
 static AINLINE u64 id_index(u64 key) { return mulhi(hash64(key), g_idcap); }
-static AINLINE u64 person_of(u64 uid) {
-  u64 i = id_index(uid);
-  for (;;) {
-    const IdSlot& s = g_ids[i];
-    if (s.key == uid) return s.val;
-    if (!s.key) return uid;
-    if (UNLIKELY(++i == g_idcap)) i = 0;
-  }
-}
 
 // ---------------------------------------------------------------- memory
 static bool g_hugepages = true;
@@ -518,7 +588,7 @@ static void* big_alloc(size_t n) {  // zeroed, 2 MB aligned
   add_region(a, n);
   return a;
 }
-static const size_t BLK = 16384, BLKH = 64;
+static const size_t BLK = 8192, BLKH = 64;
 struct Blk {
   Blk* next;
   u32 used;
@@ -551,7 +621,7 @@ struct Scatter {
   static constexpr u32 WCB = RS * NREC;
   u32 P = 0;
   char* wc = nullptr;    // P buffers of WCB bytes
-  char** wp = nullptr;   // where each partition's next record goes, inside its buffer
+  u8* fill = nullptr;    // bytes in use in each buffer; one byte each keeps the whole array in L1
   char** cur = nullptr;  // where each partition's next flush goes, inside its block
   Blk** head = nullptr;
   Blk** tail = nullptr;
@@ -561,22 +631,22 @@ struct Scatter {
   void init(u32 P_, BlkArena* a, Blk** fl) {
     P = P_, arena = a, freelist = fl;
     wc = (char*)aligned_alloc(256, (((size_t)P * WCB) + 255) & ~(size_t)255);
-    wp = (char**)malloc(P * sizeof(char*));
-    for (u32 p = 0; p < P; p++) wp[p] = wc + (size_t)p * WCB;
+    static_assert(WCB <= 255, "fill is a byte");
+    fill = (u8*)calloc(P, 1);
     cur = (char**)calloc(P, sizeof(char*));
     head = (Blk**)calloc(P, sizeof(Blk*));
     tail = (Blk**)calloc(P, sizeof(Blk*));
     nbytes = (u64*)calloc(P, sizeof(u64));
   }
   AINLINE void put(u32 p, const void* rec) {
-    char* w = wp[p];
-    memcpy(w, rec, RS);
-    w += RS;
-    if (UNLIKELY(w == wc + (size_t)(p + 1) * WCB)) {
+    u32 f = fill[p];
+    memcpy(wc + (size_t)p * WCB + f, rec, RS);
+    f += RS;
+    if (UNLIKELY(f == WCB)) {
       flush(p, WCB);
-      w -= WCB;
+      f = 0;
     }
-    wp[p] = w;
+    fill[p] = (u8)f;
   }
   NOINLINE void flush(u32 p, u32 n) {
     char* c = cur[p];
@@ -609,9 +679,8 @@ struct Scatter {
   }
   void finish() {
     for (u32 p = 0; p < P; p++) {
-      char* base = wc + (size_t)p * WCB;
-      if (wp[p] != base) flush(p, (u32)(wp[p] - base));
-      wp[p] = base;
+      if (fill[p]) flush(p, fill[p]);
+      fill[p] = 0;
       if (tail[p]) tail[p]->used = (u32)(cur[p] - ((char*)tail[p] + BLKH));
     }
 #if defined(__x86_64__)
@@ -686,16 +755,16 @@ struct Buf {
 struct Ev {  // parsed event, before dedup
   u64 eid, uid;
   u32 ts;      // ms from WS, or TS_INVALID when the copy fails validation
-  u32 ingest;  // seconds from WS, biased
+  u32 ingest;  // ordered like the ingest time: day << 24 | HHMMSS in BCD
   u32 pc;      // price << 8 | category for a purchase, else 0
   u32 pad;
 };
 struct Ev2 {  // surviving event
-  u64 person;
+  u64 uid;
   u64 tspc;  // ts << 32 | pc
 };
 struct Ck {  // valid click
-  u64 person, cid;
+  u64 uid, cid;
   u32 ts;  // ms from WS - 7 days
   u32 camp;
 };
@@ -735,6 +804,7 @@ struct alignas(64) TC {
   Scatter<32, 4> evs;
   Scatter<16, 8> pes;
   Scatter<24, 8> cks;
+  Scatter<4, 32> fwd;  // 32-bit words: the events of linked IDs, on their way to the person's partition
   Idx ix;
   vector<std::pair<u64, u64>> pairs;
   u64 n_lines = 0, n_slow = 0;
@@ -748,15 +818,34 @@ struct alignas(64) TC {
   u32 ltcap = 0, ltbits = 0;
   Arr<u64> pkey, eva, evb, ckey;
   Arr<u32> cnt, pos, ccnt, cpos, cidx;
+  Arr<u8> plink;
   Arr<Pu> pu;
   Arr<CkItem> ck, craw;
-  u32 hb[4096];
+  u32 hb[8192];
   u32 *wcnt = nullptr, *wpos = nullptr, *wact = nullptr;
   u32 nact = 0;
   u32* stamp = nullptr;  // per campaign: the last session that counted it as an assist
   u32 sid = 0;
   i64* catrev = nullptr;
-  u32 *a_sess = nullptr, *a_purch = nullptr, *a_asst = nullptr;
+  // campaign_daily, indexed [campaign * ND + day]: a person's campaigns are
+  // few and their days are neighbours, so the cells they touch share cache lines
+  struct Agg {
+    u32 sess, asst;
+  };
+  struct Agg8 {
+    u8 sess, asst;
+  };
+  // Sessions and assists are counted in one byte per cell, a table small
+  // enough to stay in cache; a byte that wraps carries 256 into the wide one.
+  Agg8* agg8 = nullptr;
+  Agg* agg = nullptr;
+  AINLINE void add_sess(size_t at) {
+    if (UNLIKELY(++agg8[at].sess == 0)) agg[at].sess += 256;
+  }
+  AINLINE void add_asst(size_t at) {
+    if (UNLIKELY(++agg8[at].asst == 0)) agg[at].asst += 256;
+  }
+  u32* a_purch = nullptr;
   i64* a_rev = nullptr;
   Out out;
 };
@@ -905,7 +994,9 @@ static void stage1_generic(const char* T, u32 len, Idx& ix) {
 }
 #if defined(__x86_64__)
 // The same pass with AVX-512: mask registers straight from the compares, and
-// VBMI2's byte compress to turn a mask into positions.
+// VBMI2's byte compress to turn a mask into positions. Only for CPUs with
+// VBMI2 (Ice Lake and later): on Skylake-X and Cascade Lake any 512-bit
+// instruction lowers the core's frequency and costs more than it saves.
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vbmi2,bmi,bmi2,popcnt,lzcnt")))
 static void stage1_vbmi2(const char* T, u32 len, Idx& ix) {
   const u32 nb = (len + 63) >> 6;
@@ -994,14 +1085,11 @@ static NOINLINE void slow_event(TC& tc, const char* s, const char* e) {
     ok = false;
     r.ingest = 0xFFFFFFFFu;
   } else {
-    // Exact only as whole seconds within 68 years of the window.
-    i64 d = ing == TS_HUGE ? TS_HUGE : ing - WS;
-    i64 sec = d / 1000 + INGEST_BIAS;
-    if (d == TS_HUGE || d % 1000 != 0 || sec < 0 || sec > 0xFFFFFFFEll) {
+    // Exact only as whole seconds within about two months of the window.
+    if (!ingest_key(ing, r.ingest)) {
       g_bail.store(true, std::memory_order_relaxed);
       return;
     }
-    r.ingest = (u32)sec;
     if (ok && ing - ts > DAYMS) ok = false;
   }
   if (ok) {
@@ -1029,15 +1117,18 @@ static NOINLINE i64 ts_generic(const char* p, u32 n, i64 lo, i64 hi) {
 }
 // S holds the starts of the line's seven fields; the line ends at nl. Returns
 // false for the few lines the generic parser has to take.
-static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char** wp, int p1sh) {
+static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char* wc, u8* fill, int p1sh) {
   const u32 a0 = S[0], a1 = S[1], a2 = S[2], a3 = S[3], a4 = S[4], a5 = S[5];
   const u32 q0 = quoted(T, a0), q1 = quoted(T, a1), q2 = quoted(T, a2), q3 = quoted(T, a3);
   const u32 L0 = a1 - a0 - 1 - q0 - q1, L1 = a2 - a1 - 1 - q1 - q2, L2 = a3 - a2 - 1 - q2 - q3;
   if (UNLIKELY((u32)(L0 - 2) > 7u || T[a0] != 'e')) return false;
   const u64 eid = load64(T + a0 + 1) & LENMASK[L0 - 1];
   const char* ip = T + a3;
-  i64 irs;
-  if (UNLIKELY(ip[19] != 'Z' || !isterm((u8)ip[20]) || !f1_core(ip, irs))) return false;
+  if (UNLIKELY(ip[19] != 'Z' || !isterm((u8)ip[20]))) return false;
+  const u64 iw = load64(ip + 11) ^ 0x30303A30303A3030ull;  // "HH:MM:SS"
+  if (UNLIKELY((((iw + 0x060A0F060A0F060Dull) | iw) & 0xF0F0F0F0F0F0F0F0ull) != 0)) return false;
+  const u32 bcd = bcd6(iw);
+  if (UNLIKELY(bcd >= 0x240000u)) return false;
   bool valid = true;
   u64 uid = 0;
   if (LIKELY((u32)(L1 - 2) <= 7u && T[a1] == 'u'))
@@ -1058,7 +1149,20 @@ static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char
   else
     rel = ts_generic(tp, L2, WS, WE);
   valid &= (u64)rel < WLEN;
-  valid &= irs * 1000 - rel <= DAYMS;  // not late
+  // ingest_ts on the event's own UTC date cannot be more than 24 hours after
+  // it, and gives the key directly. Any other date is worked out in full.
+  u32 ikey;
+  {
+    const u32 day = valid ? (u32)(((u64)rel + WS_TOD) / (u64)DAYMS) : (u32)ND;
+    const DayStr& ds = g_daystr[day];
+    if (LIKELY(load64(ip) == ds.k0 && (load32(ip + 8) & 0xFFFFFF) == ds.ddt)) {
+      ikey = ((day + (u32)INGEST_DAY_BIAS) << 24) | bcd;
+    } else {
+      i64 ing;
+      if (UNLIKELY(!parse_ts(ip, 20, ing) || !ingest_key(ing, ikey))) return false;
+      valid &= ing - (rel + WS) <= DAYMS;  // not late
+    }
+  }
   const u64 tw = load64(T + a4);
   const u32 t4 = (u32)tw;
   u32 pc = 0;
@@ -1072,22 +1176,22 @@ static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char
     valid &= L5 != 0;
     valid &= parse_price(T + a6, nl - a6 - q6, price);
     if (valid) {
-      g_prod.find(T + a5, L5, cat);
+      find_id(g_prodn, g_prod, T + a5, L5, cat);
       pc = price << 8 | cat;
     }
   } else {
     valid = false;
   }
   const u32 p = (u32)(hash64(eid) >> p1sh);
-  char* w = wp[p];
-  Ev* d = (Ev*)w;
-  d->eid = eid, d->uid = uid, d->ts = valid ? (u32)rel : TS_INVALID, d->ingest = (u32)(irs + INGEST_BIAS), d->pc = pc, d->pad = 0;
-  w += 32;
-  if (UNLIKELY(((uintptr_t)w & 127) == 0)) {  // the buffer starts on a 128-byte boundary
+  u32 f = fill[p];
+  Ev* d = (Ev*)(wc + (size_t)p * 128 + f);
+  d->eid = eid, d->uid = uid, d->ts = valid ? (u32)rel : TS_INVALID, d->ingest = ikey, d->pc = pc, d->pad = 0;
+  f += 32;
+  if (UNLIKELY(f == 128)) {
     tc.evs.flush(p, 128);
-    w -= 128;
+    f = 0;
   }
-  wp[p] = w;
+  fill[p] = (u8)f;
   return true;
 }
 // A line of NF fields is regular when its newline is the separator after the
@@ -1106,13 +1210,14 @@ static AINLINE u32 lines_owned(const u32* NL, u32 nnl, u32 maxstart) {
 }
 static u32 stage2_events(TC& tc, const char* T, u32 nnl, u32 maxstart) {
   const u32 *sp = tc.ix.st, *NL = tc.ix.nl, *bp = tc.ix.bad;
-  char** const wp = tc.evs.wp;
+  char* const wc = tc.evs.wc;
+  u8* const fill = tc.evs.fill;
   const int p1sh = 64 - g_p1bits;
   const u32 n = lines_owned(NL, nnl, maxstart);
   u32 ls = 0;
   for (u32 i = 0; i < n; i++) {
     const u32 nl = NL[i];
-    if (REGULAR(7) && LIKELY(fast_event(tc, T, sp, nl, wp, p1sh))) {
+    if (REGULAR(7) && LIKELY(fast_event(tc, T, sp, nl, wc, fill, p1sh))) {
       sp += 7;
     } else {
       slow_event(tc, T + ls, T + nl);
@@ -1129,10 +1234,11 @@ struct CkTmp {
   u64 cid, uid;
   u32 ts, camp;
 };
+// A click goes to the partition of its user ID, as an event does.
 static AINLINE void emit_click(TC& tc, u64 cid, u64 uid, u32 ts, u32 camp) {
   Ck r;
-  r.person = person_of(uid), r.cid = cid, r.ts = ts, r.camp = camp;
-  tc.cks.put((u32)(hash64(r.person) >> (64 - g_p2bits)), &r);
+  r.uid = uid, r.cid = cid, r.ts = ts, r.camp = camp;
+  tc.cks.put((u32)(hash64(uid) >> (64 - g_p2bits)), &r);
 }
 static NOINLINE void slow_click(TC& tc, const char* s, const char* e) {
   tc.n_slow++;
@@ -1160,7 +1266,7 @@ static AINLINE int fast_click(const char* T, const u32* S, u32 nl, CkTmp& out) {
   if (UNLIKELY((u32)(L0 - 2) > 7u || T[a0] != 'k' || (u32)(L1 - 2) > 7u || T[a1] != 'u')) return -1;
   out.cid = load64(T + a0 + 1) & LENMASK[L0 - 1];
   out.uid = load64(T + a1 + 1) & LENMASK[L1 - 1];
-  if (UNLIKELY(!g_camp.find(T + a2, L2, out.camp))) return 0;
+  if (UNLIKELY(!find_id(g_campn, g_camp, T + a2, L2, out.camp))) return 0;
   const char* tp = T + a3;
   i64 rel, rs;
   u64 v;
@@ -1180,27 +1286,19 @@ static u32 stage2_clicks(TC& tc, const char* T, u32 nnl, u32 maxstart) {
   const u32 *sp = tc.ix.st, *NL = tc.ix.nl, *bp = tc.ix.bad;
   const u32 n = lines_owned(NL, nnl, maxstart);
   u32 ls = 0;
-  CkTmp tmp[64];
-  u32 nt = 0;
+  CkTmp c;
   for (u32 i = 0; i < n; i++) {
     const u32 nl = NL[i];
     int r = -1;
-    if (REGULAR(4) && LIKELY((r = fast_click(T, sp, nl, tmp[nt])) >= 0)) {
+    if (REGULAR(4) && LIKELY((r = fast_click(T, sp, nl, c)) >= 0)) {
       sp += 4;
-      if (r) {
-        __builtin_prefetch(&g_ids[id_index(tmp[nt].uid)]);
-        if (++nt == 64) {
-          for (u32 k = 0; k < 64; k++) emit_click(tc, tmp[k].cid, tmp[k].uid, tmp[k].ts, tmp[k].camp);
-          nt = 0;
-        }
-      }
+      if (r) emit_click(tc, c.cid, c.uid, c.ts, c.camp);
     } else {
       slow_click(tc, T + ls, T + nl);
       RESYNC();
     }
     ls = nl + 1;
   }
-  for (u32 k = 0; k < nt; k++) emit_click(tc, tmp[k].cid, tmp[k].uid, tmp[k].ts, tmp[k].camp);
   tc.n_lines += n;
   return ls;
 }
@@ -1417,16 +1515,27 @@ static void do_links(TC& tc) {
     }
   }
   if (VERBOSE) fprintf(stderr, "[%8.1f ms] links: joined\n", now_ms());
-  // Point every ID at its root, then replace that by the root's key. The
-  // second pass reads only keys of other slots, so it can overwrite vals as it goes.
+  // Replace every ID's parent slot by its root's key, in one sweep. Behind the
+  // sweep a val is already the root's key and ahead of it still a parent slot,
+  // so a chain is followed only until it reaches its root or a finished slot.
   const u64 PD = 16;
   for (u64 i = 0; i < cap; i++) {
     if (i + PD < cap) __builtin_prefetch(&ids[ids[i + PD].val]);
-    if (ids[i].key) ids[i].val = find(i);
-  }
-  for (u64 i = 0; i < cap; i++) {
-    if (i + PD < cap) __builtin_prefetch(&ids[ids[i + PD].val]);
-    if (ids[i].key) ids[i].val = ids[ids[i].val].key;
+    if (!ids[i].key) continue;
+    u64 x = i, name;
+    for (;;) {
+      const u64 par = ids[x].val;
+      if (par == x) {
+        name = ids[x].key;
+        break;
+      }
+      if (par < i) {
+        name = ids[par].val;
+        break;
+      }
+      x = par;
+    }
+    ids[i].val = name;
   }
 }
 
@@ -1449,92 +1558,106 @@ static void phase2_partition(TC& tc, u32 p) {
     tc.dtab = (u64*)malloc(cap * 8);
     tc.dcap = cap;
   }
-  u64* const tab = tc.dtab;
-  memset(tab, 0, cap * 8);
   const u64 mask = cap - 1;
   const int shift = 64 - g_p1bits - sb;
-  const u64 PTR = (1ull << 48) - 1;
-  const IdSlot* const ids = g_ids;
-  const u64 idcap = g_idcap;
+  const size_t nseg = tc.segs.size();
   // Pass 1: find every event_id's copies; all but the one ingested first lose their ts.
-  for (auto& sg : tc.segs) {
-    Ev* r = sg.first;
-    Ev* const end = r + sg.second;
-    for (; r < end; r++) {
-      const u64 h = hash64(r->eid);
-      u64 i = (h >> shift) & mask;
-      const u64 tag = (h >> (shift - 16)) & 0xFFFF;
-      const u64 enc = (u64)(uintptr_t)r | (tag << 48);
-      for (;;) {
-        const u64 s = tab[i];
-        if (LIKELY(!s)) {
-          tab[i] = enc;
-          break;
-        }
-        if (UNLIKELY((s >> 48) == tag)) {
-          Ev* q = (Ev*)(uintptr_t)(s & PTR);
-          if (q->eid == r->eid) {
-            if (r->ingest < q->ingest) {
-              q->ts = TS_INVALID;
-              tab[i] = enc;
-            } else {
-              r->ts = TS_INVALID;
-            }
+  static_assert((BLK - BLKH) / sizeof(Ev) <= 256, "a record's index in its block fits a byte");
+  if (LIKELY(nseg <= 255)) {
+    // Slots of four bytes, so that the table stays in cache: 16 bits of the
+    // hash, then the record as (its block + 1, its index in the block).
+    u32* const tab = (u32*)tc.dtab;
+    memset(tab, 0, cap * 4);
+    const auto* const segs = tc.segs.data();
+    for (size_t si = 0; si < nseg; si++) {
+      Ev* const base = segs[si].first;
+      const u32 n = segs[si].second;
+      const u32 where = (u32)(si + 1) << 8;
+      for (u32 j = 0; j < n; j++) {
+        Ev* const r = base + j;
+        const u64 h = hash64(r->eid);
+        u64 i = (h >> shift) & mask;
+        const u32 tag = (u32)(h >> (shift - 16)) & 0xFFFF;
+        const u32 enc = (tag << 16) | where | j;
+        for (;;) {
+          const u32 s = tab[i];
+          if (LIKELY(!s)) {
+            tab[i] = enc;
             break;
           }
+          if (UNLIKELY((s >> 16) == tag)) {
+            Ev* q = segs[((s >> 8) & 0xFF) - 1].first + (s & 0xFF);
+            if (q->eid == r->eid) {
+              if (r->ingest < q->ingest) {
+                q->ts = TS_INVALID;
+                tab[i] = enc;
+              } else {
+                r->ts = TS_INVALID;
+              }
+              break;
+            }
+          }
+          i = (i + 1) & mask;
         }
-        i = (i + 1) & mask;
+      }
+    }
+  } else {
+    u64* const tab = tc.dtab;
+    memset(tab, 0, cap * 8);
+    const u64 PTR = (1ull << 48) - 1;
+    for (auto& sg : tc.segs) {
+      Ev* r = sg.first;
+      Ev* const end = r + sg.second;
+      for (; r < end; r++) {
+        const u64 h = hash64(r->eid);
+        u64 i = (h >> shift) & mask;
+        const u64 tag = (h >> (shift - 16)) & 0xFFFF;
+        const u64 enc = (u64)(uintptr_t)r | (tag << 48);
+        for (;;) {
+          const u64 s = tab[i];
+          if (LIKELY(!s)) {
+            tab[i] = enc;
+            break;
+          }
+          if (UNLIKELY((s >> 48) == tag)) {
+            Ev* q = (Ev*)(uintptr_t)(s & PTR);
+            if (q->eid == r->eid) {
+              if (r->ingest < q->ingest) {
+                q->ts = TS_INVALID;
+                tab[i] = enc;
+              } else {
+                r->ts = TS_INVALID;
+              }
+              break;
+            }
+          }
+          i = (i + 1) & mask;
+        }
       }
     }
   }
-  // Pass 2: the survivors, by person. The person table is far larger than the
-  // cache, so each lookup's slot is fetched a few records ahead.
+  // Pass 2: the survivors, by user ID. Who each ID belongs to is looked up
+  // later, once per ID instead of once per event.
   const int sh2 = 64 - g_p2bits;
-  char** const wp = tc.pes.wp;
-  const u32 PD = 16;
-  u64 ring[PD];
+  char* const wc = tc.pes.wc;
+  u8* const fill = tc.pes.fill;
   for (auto& sg : tc.segs) {
     const Ev* const r = sg.first;
     const u32 n = sg.second;
-    const u32 head = std::min(n, PD);
-    for (u32 j = 0; j < head; j++) {
-      const u64 i = mulhi(hash64(r[j].uid), idcap);
-      ring[j] = i;
-      __builtin_prefetch(&ids[i]);
-    }
     for (u32 j = 0; j < n; j++) {
-      u64 i = ring[j & (PD - 1)];
-      if (LIKELY(j + PD < n)) {
-        const u64 nx = mulhi(hash64(r[j + PD].uid), idcap);
-        ring[j & (PD - 1)] = nx;
-        __builtin_prefetch(&ids[nx]);
-      }
       const u32 ts = r[j].ts;
       if (UNLIKELY(ts == TS_INVALID)) continue;
       const u64 uid = r[j].uid;
-      u64 person;
-      for (;;) {
-        const IdSlot& sl = ids[i];
-        if (sl.key == uid) {
-          person = sl.val;
-          break;
-        }
-        if (LIKELY(!sl.key)) {
-          person = uid;
-          break;
-        }
-        if (UNLIKELY(++i == idcap)) i = 0;
-      }
-      const u32 q = (u32)(hash64(person) >> sh2);
-      char* w = wp[q];
-      Ev2* d = (Ev2*)w;
-      d->person = person, d->tspc = ((u64)ts << 32) | r[j].pc;
-      w += 16;
-      if (UNLIKELY(((uintptr_t)w & 127) == 0)) {
+      const u32 q = (u32)(hash64(uid) >> sh2);
+      u32 f = fill[q];
+      Ev2* d = (Ev2*)(wc + (size_t)q * 128 + f);
+      d->uid = uid, d->tspc = ((u64)ts << 32) | r[j].pc;
+      f += 16;
+      if (UNLIKELY(f == 128)) {
         tc.pes.flush(q, 128);
-        w -= 128;
+        f = 0;
       }
-      wp[q] = w;
+      fill[q] = (u8)f;
     }
   }
   for (int t = 0; t < NT; t++) {  // hand the blocks to this thread's scatter
@@ -1730,7 +1853,7 @@ static void do_person(TC& tc, u64 person, u32 li, const u64* ev, u32 n, CkItem* 
     r_s++, r_e += events, r_rev += rev;
     u32 credit = ORGANIC;
     if (few) {  // click times are measured from WS - 7 days, so the window is [start, start + 7 days]
-      u32* row = tc.a_asst + (size_t)day * (NCAMP + 1);
+      const size_t nd = (size_t)ND;
       u32* const stamp = tc.stamp;
       const u32 sid = ++tc.sid;
       u32 best = 0;
@@ -1740,7 +1863,7 @@ static void do_person(TC& tc, u64 person, u32 li, const u64* ev, u32 n, CkItem* 
         const u32 t = ck[k].ts;
         if (t - start > SEVEN_MS) continue;
         const u32 c = ck[k].camp;
-        if (stamp[c] != sid) stamp[c] = sid, row[c]++;
+        if (stamp[c] != sid) stamp[c] = sid, tc.add_asst(c * nd + day);
         if (!found || t > best || (t == best && ck[k].cid != bestid && id_less(ck[k].cid, bestid, 'k'))) found = true, best = t, bestid = ck[k].cid, credit = c;
       }
     } else {
@@ -1751,13 +1874,13 @@ static void do_person(TC& tc, u64 person, u32 li, const u64* ev, u32 n, CkItem* 
         u32 b = hi - 1;
         while (b > lo && ck[b - 1].ts == ck[b].ts) b--;
         credit = ck[b].camp;
-        u32* row = tc.a_asst + (size_t)day * (NCAMP + 1);
+        const size_t nd = (size_t)ND;
         const u32* act = tc.wact;
-        for (u32 k = 0, na = tc.nact; k < na; k++) row[act[k]]++;
+        for (u32 k = 0, na = tc.nact; k < na; k++) tc.add_asst(act[k] * nd + day);
       }
     }
-    size_t at = (size_t)day * (NCAMP + 1) + credit;
-    tc.a_sess[at]++;
+    size_t at = (size_t)credit * (size_t)ND + day;
+    tc.add_sess(at);
     if (rev > 0) tc.a_purch[at]++, tc.a_rev[at] += rev;
     if (!more) break;
   }
@@ -1777,75 +1900,215 @@ static NOINLINE void lt_grow(TC& tc) {
     }
   free(old);
 }
-static vector<u64> g_p2events, g_p2clicks;  // bytes per person partition
-static void phase3_partition(TC& tc, u32 p) {
-  const size_t N = g_p2events[p] / sizeof(Ev2);
-  if (!N) return;
-  const size_t NCK = g_p2clicks[p] / sizeof(Ck);
+static vector<u64> g_p2events, g_p2clicks, g_p2fwd;  // bytes per partition: events by user ID, clicks by person, forwarded words
+// The 32-bit words one thread forwarded to a partition, across its blocks.
+struct WordReader {
+  const Blk* b;
+  const u32 *p = nullptr, *e = nullptr;
+  explicit WordReader(const Blk* head) : b(head) { open(); }
+  void open() {
+    for (; b; b = b->next)
+      if (b->used) {
+        p = (const u32*)((const char*)b + BLKH), e = p + b->used / 4;
+        return;
+      }
+    p = e = nullptr;
+  }
+  bool more() {
+    if (p != e) return true;
+    if (!b) return false;
+    b = b->next;
+    open();
+    return p != e;
+  }
+  u32 next() {
+    if (p == e) more();
+    return *p++;
+  }
+};
+// Sends the events and clicks of one linked ID to the partition of the person
+// it belongs to: the person, three counts, every event's ts, (ts, pc) per
+// purchase, (click_id, ts, campaign) per click.
+static AINLINE void forward_run(TC& tc, u64 root, u32 li, const u64* ev, u32 n, const Pu*& pu, const Pu* pu_end, const CkItem* ck, u32 m) {
+  const Pu* const p0 = pu;
+  while (pu < pu_end && (u32)(pu->key >> 32) == li) pu++;
+  auto& fw = tc.fwd;
+  const u32 q = (u32)(hash64(root) >> (64 - g_p2bits));
+  char* const base = fw.wc + (size_t)q * 128;
+  u32 f = fw.fill[q];
+  auto put = [&](u32 w) {
+    memcpy(base + f, &w, 4);
+    f += 4;
+    if (UNLIKELY(f == 128)) {
+      fw.flush(q, 128);
+      f = 0;
+    }
+  };
+  put((u32)root), put((u32)(root >> 32)), put(n), put((u32)(pu - p0)), put(m);
+  for (u32 i = 0; i < n; i++) put((u32)ev[i]);
+  for (const Pu* x = p0; x < pu; x++) put((u32)x->key), put(x->pc);
+  for (u32 i = 0; i < m; i++) put((u32)ck[i].cid), put((u32)(ck[i].cid >> 32)), put(ck[i].ts), put(ck[i].camp);
+  fw.fill[q] = (u8)f;
+}
+// Phase 3 runs twice over the partitions.
+// First round (merged = false): partition p of the events and clicks, split
+// by user ID. Each ID is looked up in the links once. People with no link are
+// finished here; what a linked ID has is forwarded to its person's partition.
+// Second round (merged = true): partition p of what was forwarded, by person.
+static void phase3_partition(TC& tc, u32 p, bool merged) {
+  const size_t N = merged ? g_p2fwd[p] / 4 : g_p2events[p] / sizeof(Ev2);      // at most this many events
+  const size_t NCK = merged ? g_p2fwd[p] / 16 : g_p2clicks[p] / sizeof(Ck);  // and clicks
+  if (!N && !NCK) return;
   tc.eva.ensure(N), tc.evb.ensure(N), tc.pu.ensure(N);
+  tc.craw.ensure(NCK), tc.cidx.ensure(NCK), tc.ck.ensure(NCK);
+  u32 nc = 0;  // clicks in this partition
   if (!tc.lt) {
     tc.ltcap = 1024, tc.ltbits = 10;
     tc.lt = (LSlot*)malloc(tc.ltcap * sizeof(LSlot));
   }
   memset(tc.lt, 0, (size_t)tc.ltcap * sizeof(LSlot));
-  memset(tc.hb, 0, (size_t)g_nbkt * sizeof(u32));
+  memset(tc.hb, 0, (size_t)g_nbkt * sizeof(u32) * (merged ? 2 : 1));
   u32 np = 0, npu = 0;
   u64* A = tc.eva.p;
   u64* B = tc.evb.p;
   Pu* pu = tc.pu.p;
   const int bbits = g_bbits, p2bits = g_p2bits;
   const u32 maxli = (1u << (32 - bbits)) - 1;
-  // Give each person an index, and pack (index, bucket, ts) for every event.
+  size_t NE = 0;  // events in this partition
+  // Give each ID or person an index, and pack (index, bucket, ts) for every event.
   {
     u32* __restrict hb = tc.hb;
     size_t j = 0;
-    for (int t = 0; t < NT; t++)
-      for (Blk* b = g_tc[t]->pes.head[p]; b; b = b->next) {
-        const Ev2* r = (const Ev2*)((char*)b + BLKH);
-        const u32 n = b->used / (u32)sizeof(Ev2);
-        LSlot* lt = tc.lt;
-        u32 ltmask = tc.ltcap - 1;
-        int ltsh = 64 - (int)tc.ltbits;
-        u32* cnt = tc.cnt.p;
-        for (u32 k = 0; k < n; k++) {
-          const u64 key = r[k].person;
-          u32 s = (u32)((hash64(key) << p2bits) >> ltsh);
-          u32 li;
-          for (;;) {
-            LSlot& sl = lt[s];
-            if (LIKELY(sl.key == key)) {
-              li = sl.val;
-              break;
-            }
-            if (!sl.key) {
-              li = np++;
-              sl.key = key, sl.val = li;
-              tc.pkey.keep(np), tc.cnt.keep(np);
-              tc.pkey[li] = key, tc.cnt[li] = 0;
-              if (UNLIKELY(np * 2 > tc.ltcap)) lt_grow(tc);
-              lt = tc.lt, ltmask = tc.ltcap - 1, ltsh = 64 - (int)tc.ltbits, cnt = tc.cnt.p;
-              break;
-            }
-            s = (s + 1) & ltmask;
+    LSlot* lt = tc.lt;
+    u32 ltmask = tc.ltcap - 1;
+    int ltsh = 64 - (int)tc.ltbits;
+    u32* cnt = tc.cnt.p;
+    auto index_of = [&](u64 key) -> u32 {
+      u32 s = (u32)((hash64(key) << p2bits) >> ltsh);
+      for (;;) {
+        LSlot& sl = lt[s];
+        if (LIKELY(sl.key == key)) return sl.val;
+        if (!sl.key) {
+          const u32 li = np++;
+          sl.key = key, sl.val = li;
+          tc.pkey.keep(np), tc.cnt.keep(np);
+          tc.pkey[li] = key, tc.cnt[li] = 0;
+          if (UNLIKELY(np * 2 > tc.ltcap)) lt_grow(tc);
+          lt = tc.lt, ltmask = tc.ltcap - 1, ltsh = 64 - (int)tc.ltbits, cnt = tc.cnt.p;
+          return li;
+        }
+        s = (s + 1) & ltmask;
+      }
+    };
+    if (!merged) {
+      for (int t = 0; t < NT; t++)
+        for (Blk* b = g_tc[t]->pes.head[p]; b; b = b->next) {
+          const Ev2* r = (const Ev2*)((char*)b + BLKH);
+          const u32 n = b->used / (u32)sizeof(Ev2);
+          for (u32 k = 0; k < n; k++) {
+            const u32 li = index_of(r[k].uid);
+            const u64 tspc = r[k].tspc;
+            const u32 ts = (u32)(tspc >> 32), pc = (u32)tspc;
+            const u32 bk = ts / GAP_MS;
+            A[j++] = ((u64)((li << bbits) | bk) << 32) | ts;
+            hb[bk]++;
+            cnt[li]++;
+            if (UNLIKELY(pc != 0)) pu[npu++] = Pu{((u64)li << 32) | ts, pc, 0};
           }
-          const u64 tspc = r[k].tspc;
-          const u32 ts = (u32)(tspc >> 32), pc = (u32)tspc;
-          const u32 bk = ts / GAP_MS;
-          A[j++] = ((u64)((li << bbits) | bk) << 32) | ts;
-          hb[bk]++;
-          cnt[li]++;
-          if (UNLIKELY(pc != 0)) pu[npu++] = Pu{((u64)li << 32) | ts, pc, 0};
+        }
+      CkItem* const craw = tc.craw.p;
+      u32* const cidx = tc.cidx.p;
+      for (int t = 0; t < NT; t++)
+        for (Blk* b = g_tc[t]->cks.head[p]; b; b = b->next) {
+          const Ck* r = (const Ck*)((char*)b + BLKH);
+          const u32 n = b->used / (u32)sizeof(Ck);
+          for (u32 k = 0; k < n; k++) {
+            cidx[nc] = index_of(r[k].uid);  // an ID with clicks and no events gets an index too: it may be linked
+            craw[nc++] = CkItem{r[k].cid, r[k].ts, r[k].camp};
+          }
+        }
+    } else {
+      CkItem* const craw = tc.craw.p;
+      u32* const cidx = tc.cidx.p;
+      for (int t = 0; t < NT; t++) {
+        WordReader rd(g_tc[t]->fwd.head[p]);
+        while (rd.more()) {
+          u64 root = rd.next();
+          root |= (u64)rd.next() << 32;
+          u32 n = rd.next();
+          const u32 k = rd.next();
+          const u32 m = rd.next();
+          const u32 li = index_of(root);
+          cnt[li] += n;
+          const u64 top = (u64)li << bbits;
+          while (n) {
+            rd.more();
+            const u32 c = std::min(n, (u32)(rd.e - rd.p));
+            const u32* __restrict w = rd.p;
+            for (u32 i = 0; i < c; i++) {  // a run comes in bucket order: its neighbours share buckets
+              const u32 ts = w[i];
+              const u32 bk = ts / GAP_MS;
+              A[j++] = ((top | bk) << 32) | ts;
+              hb[(bk << 1) | (i & 1)]++;
+            }
+            rd.p += c, n -= c;
+          }
+          for (u32 i = 0; i < k; i++) {
+            const u32 ts = rd.next();
+            const u32 pc = rd.next();
+            pu[npu++] = Pu{((u64)li << 32) | ts, pc, 0};
+          }
+          for (u32 i = 0; i < m; i++) {
+            u64 cid = rd.next();
+            cid |= (u64)rd.next() << 32;
+            const u32 ts = rd.next();
+            const u32 camp = rd.next();
+            cidx[nc] = li;
+            craw[nc++] = CkItem{cid, ts, camp};
+          }
         }
       }
+    }
+    NE = j;
+    if (merged)
+      for (u32 i = 0, nb = g_nbkt; i < nb; i++) hb[i] = hb[2 * i] + hb[2 * i + 1];
   }
   if (UNLIKELY(np > maxli)) {  // the packing above has no room for this many people
     g_bail.store(true, std::memory_order_relaxed);
     return;
   }
-  // Order by (person index, bucket): one counting pass on each.
+  // First round: which of these IDs are in a link, and whose are they. The
+  // table is far larger than the cache, so each slot is fetched a few IDs ahead.
+  u8* plink = nullptr;
+  if (!merged) {
+    tc.plink.ensure(np);
+    plink = tc.plink.p;
+    const IdSlot* const ids = g_ids;
+    const u64 idcap = g_idcap;
+    u64* const pkey = tc.pkey.p;
+    const u32 PD = 16;
+    for (u32 i = 0, e = std::min(np, PD); i < e; i++) __builtin_prefetch(&ids[mulhi(hash64(pkey[i]), idcap)]);
+    for (u32 i = 0; i < np; i++) {
+      if (LIKELY(i + PD < np)) __builtin_prefetch(&ids[mulhi(hash64(pkey[i + PD]), idcap)]);
+      const u64 uid = pkey[i];
+      u64 s = mulhi(hash64(uid), idcap);
+      u8 linked = 0;
+      for (;;) {
+        const IdSlot& sl = ids[s];
+        if (sl.key == uid) {
+          pkey[i] = sl.val, linked = 1;
+          break;
+        }
+        if (LIKELY(!sl.key)) break;
+        if (UNLIKELY(++s == idcap)) s = 0;
+      }
+      plink[i] = linked;
+    }
+  }
+  // Order by (index, bucket): one counting pass on each.
   tc.pos.ensure(np + 1), tc.ccnt.ensure(np + 1), tc.cpos.ensure(np + 1);
-  if (N < 128) {
-    std::sort(A, A + N);
+  if (NE < 128) {
+    std::sort(A, A + NE);
   } else {
     u32* __restrict hb = tc.hb;
     u32* __restrict ps = tc.pos.p;
@@ -1860,41 +2123,20 @@ static void phase3_partition(TC& tc, u32 p) {
     for (u32 i = 0; i < np; i++) ps[i] = acc, acc += tc.cnt[i];
     const u32 bmask = (1u << bbits) - 1;
     const int lsh = 32 + bbits;
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < NE; i++) {
       const u64 v = a[i];
       b[hb[(u32)(v >> 32) & bmask]++] = v;
     }
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < NE; i++) {
       const u64 v = b[i];
       a[ps[v >> lsh]++] = v;
     }
   }
   if (npu > 1) std::sort(pu, pu + npu, [](const Pu& x, const Pu& y) { return x.key < y.key; });
-  // clicks of the people who have events
-  u32 nc = 0;
+  // Group the clicks by index.
   for (u32 i = 0; i < np; i++) tc.ccnt[i] = 0;
-  if (NCK) {
-    tc.craw.ensure(NCK), tc.cidx.ensure(NCK), tc.ck.ensure(NCK);
-    for (int t = 0; t < NT; t++)
-      for (Blk* b = g_tc[t]->cks.head[p]; b; b = b->next) {
-        const Ck* r = (const Ck*)((char*)b + BLKH);
-        u32 n = b->used / (u32)sizeof(Ck);
-        for (u32 k = 0; k < n; k++) {
-          u64 key = r[k].person;
-          u32 s = (u32)((hash64(key) << g_p2bits) >> (64 - tc.ltbits));
-          for (;;) {
-            const LSlot& sl = tc.lt[s];
-            if (sl.key == key) {
-              tc.craw[nc] = CkItem{r[k].cid, r[k].ts, r[k].camp};
-              tc.cidx[nc++] = sl.val;
-              tc.ccnt[sl.val]++;
-              break;
-            }
-            if (!sl.key) break;
-            s = (s + 1) & (tc.ltcap - 1);
-          }
-        }
-      }
+  if (nc) {
+    for (u32 i = 0; i < nc; i++) tc.ccnt[tc.cidx[i]]++;
     u32 acc = 0;
     for (u32 i = 0; i < np; i++) tc.cpos[i] = acc, acc += tc.ccnt[i];
     for (u32 i = 0; i < nc; i++) tc.ck[tc.cpos[tc.cidx[i]]++] = tc.craw[i];
@@ -1902,11 +2144,31 @@ static void phase3_partition(TC& tc, u32 p) {
   const Pu* pc = pu;
   const Pu* pe = pu + npu;
   u32 e0 = 0, c0 = 0;
+  const int fsh = 64 - g_p2bits;
   for (u32 i = 0; i < np; i++) {
     u32 n = tc.cnt[i], m = tc.ccnt[i];
-    do_person(tc, tc.pkey[i], i, A + e0, n, m ? tc.ck.p + c0 : nullptr, m, pc, pe);
+    if (plink && i + 4 < np) {  // the buffer the fourth person from here may be forwarded to
+      const u32 q = (u32)(hash64(tc.pkey[i + 4]) >> fsh);
+      __builtin_prefetch(tc.fwd.wc + (size_t)q * 128 + tc.fwd.fill[q], 1);
+    }
+    if (plink && plink[i])
+      forward_run(tc, tc.pkey[i], i, A + e0, n, pc, pe, tc.ck.p + c0, m);
+    else if (n)  // clicks alone make no session
+      do_person(tc, tc.pkey[i], i, A + e0, n, m ? tc.ck.p + c0 : nullptr, m, pc, pe);
     e0 += n, c0 += m;
   }
+  if (!merged)  // this partition's blocks carry what is forwarded from here on
+    for (int t = 0; t < NT; t++)
+      for (Blk** h : {&g_tc[t]->pes.head[p], &g_tc[t]->cks.head[p]}) {
+        Blk* b = *h;
+        *h = nullptr;
+        while (b) {
+          Blk* nx = b->next;
+          b->next = tc.freelist;
+          tc.freelist = b;
+          b = nx;
+        }
+      }
 }
 
 // ---------------------------------------------------------------- parquet
@@ -2052,7 +2314,7 @@ static void write_parquet(const string& path, vector<PqCol>& cols, i64 nrows) {
   m.i64f(2, total);
   m.i64f(3, nrows);
   m.list_end_elem();
-  m.strf(6, "sessions-cpp");
+  m.strf(6, "sessions-cpp 2.4 (build 0d365338c9c2)");
   m.byte(0);
   u32 ml = (u32)m.b.size();
   m.b.append((const char*)&ml, 4);
@@ -2218,17 +2480,23 @@ int main(int argc, char** argv) {
     for (u32 r = 0; r < NCAT; r++) rank[order[r]] = r, g_cat_names[r] = names[order[r]];
     UNKNOWN_CAT = (u32)(std::find(g_cat_names.begin(), g_cat_names.end(), "unknown") - g_cat_names.begin());
     g_prod.init(prods.size());
-    for (auto& p : prods) g_prod.insert(p.p, p.n, rank[p.cat]);
+    g_prodn.init("p");
+    for (auto& p : prods)
+      if (g_prod.insert(p.p, p.n, rank[p.cat])) g_prodn.insert(p.p, p.n, rank[p.cat]);
   }
   {
     string s = read_all(data + "/campaigns.csv");
     size_t lines = (size_t)std::count(s.begin(), s.end(), '\n') + 1;
     g_camp.init(lines);
+    g_campn.init("c_");
     for_lines(s, [&](const char* a, const char* b) {
       const char* fp[2];
       u32 fl[2];
       if (!split(a, b, 2, fp, fl)) return;
-      if (g_camp.insert(fp[0], fl[0], (u32)g_camp_id.size())) g_camp_id.emplace_back(fp[0], fl[0]), g_camp_chan.emplace_back(fp[1], fl[1]);
+      if (g_camp.insert(fp[0], fl[0], (u32)g_camp_id.size())) {
+        g_campn.insert(fp[0], fl[0], (u32)g_camp_id.size());
+        g_camp_id.emplace_back(fp[0], fl[0]), g_camp_chan.emplace_back(fp[1], fl[1]);
+      }
     });
     NCAMP = (u32)g_camp_id.size();
     ORGANIC = NCAMP;
@@ -2354,7 +2622,6 @@ int main(int argc, char** argv) {
     }
     tc.evs.finish();
     tc.t_ev = now_ms();
-    while (!links_done.load()) sched_yield();
     for (;;) {
       size_t i = ck_next.fetch_add(1, std::memory_order_relaxed);
       if (i >= ck_tasks.size()) break;
@@ -2430,12 +2697,32 @@ int main(int argc, char** argv) {
       tc.wcnt = (u32*)calloc(NCAMP + 1, 4), tc.wpos = (u32*)calloc(NCAMP + 1, 4), tc.wact = (u32*)calloc(NCAMP + 1, 4);
       tc.stamp = (u32*)calloc(NCAMP + 1, 4);
       tc.catrev = (i64*)calloc(256, 8);
-      tc.a_sess = (u32*)calloc(NAGG, 4), tc.a_purch = (u32*)calloc(NAGG, 4), tc.a_asst = (u32*)calloc(NAGG, 4);
+      tc.agg = (TC::Agg*)calloc(NAGG, sizeof(TC::Agg)), tc.agg8 = (TC::Agg8*)calloc(NAGG, sizeof(TC::Agg8));
+      tc.a_purch = (u32*)calloc(NAGG, 4);
       tc.a_rev = (i64*)calloc(NAGG, 8);
+      tc.fwd.init(P2, &tc.arena, &tc.freelist);
       for (;;) {
         u32 i = next.fetch_add(1, std::memory_order_relaxed);
         if (i >= P2) break;
-        phase3_partition(tc, order[i]);
+        phase3_partition(tc, order[i], false);
+      }
+      tc.fwd.finish();
+    });
+  }
+  if (g_bail.load()) return fallback();
+  tick("people without links");
+  g_p2fwd.assign(P2, 0);
+  for (auto* tc : g_tc)
+    for (u32 p = 0; p < P2; p++) g_p2fwd[p] += tc->fwd.nbytes[p];
+  std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return g_p2fwd[a] > g_p2fwd[b]; });
+  {
+    std::atomic<u32> next{0};
+    parallel(NT, [&](int t) {
+      TC& tc = *g_tc[t];
+      for (;;) {
+        u32 i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= P2) break;
+        phase3_partition(tc, order[i], true);
       }
       if (tc.out.rows || t == 0) write_user_daily(tc, udd);
     });
@@ -2449,9 +2736,10 @@ int main(int argc, char** argv) {
     i64 n = 0;
     for (u32 c = 0; c <= NCAMP; c++)
       for (int d = 0; d < ND; d++) {
-        size_t at = (size_t)d * (NCAMP + 1) + c;
+        size_t at = (size_t)c * (size_t)ND + d;
         i64 s = 0, pu = 0, rv = 0, as = 0;
-        for (auto* tc : g_tc) s += tc->a_sess[at], pu += tc->a_purch[at], rv += tc->a_rev[at], as += tc->a_asst[at];
+        for (auto* tc : g_tc)
+          s += tc->agg[at].sess + tc->agg8[at].sess, pu += tc->a_purch[at], rv += tc->a_rev[at], as += tc->agg[at].asst + tc->agg8[at].asst;
         if (!s && !as) continue;
         const string& id = c == ORGANIC ? string("organic") : g_camp_id[c];
         const string& ch = c == ORGANIC ? string("organic") : g_camp_chan[c];
