@@ -195,6 +195,7 @@ static u64 id_key(const char* p, u32 n, char pfx) {  // n > 0
 }
 static AINLINE bool is_raw(u64 k) { return (k & 0xFF) != 0; }
 static AINLINE u32 raw_len(u64 k) { return 8 - ((u32)std::countl_zero(k) >> 3); }
+static u64 g_ekey = 0, g_ckey = 0, g_nv = 0, g_nw = 0;  // dense indices (see there)
 // A few busy user IDs whose events and clicks are sampled while parsing; the
 // samples recover the generator's ID scramble keys (see "dense indices").
 static u64 g_tgt[8];
@@ -894,6 +895,7 @@ struct alignas(64) TC {
   };
   vector<Samp> esamp, csamp;
   u64 vmax = 0, wmax = 0;
+  u32* darr = nullptr;  // phase 2 dedup slots of one index range
   double p2a = 0, p2b = 0;  // VERBOSE: ms in phase 2 passes
   Scatter<24, 8> cks2;
   vector<u64> dev;
@@ -1104,6 +1106,58 @@ static void (*g_stage1)(const char*, u32, Idx&) = stage1_generic;
 static AINLINE u32 isterm(u32 c) { return (c == ',') | (c == '"'); }  // what can follow a field's content
 static AINLINE u32 quoted(const char* T, u32 a) { return (T + a)[-1] == '"'; }  // a is a field's start
 
+static const u64 SMASK = (1ull << 40) - 1;
+static const u64 SM1 = 0x9E3779B97F4Bull, SM2 = 0xD6E8FEB86659ull;
+static u64 SI1 = 0, SI2 = 0;
+static bool g_dense = false;
+static Ev2* g_E = nullptr;
+static Ck* g_C = nullptr;
+static u64 inv_odd(u64 a) {  // inverse modulo 2^64 of an odd number
+  u64 x = a;
+  for (int i = 0; i < 6; i++) x *= 2 - a * x;
+  return x;
+}
+static u8 B36T[256];  // digit value, or 64 for a character that is not a base-36 digit
+static AINLINE u64 b36_raw(u64 raw) {  // the canonical base-36 value of a raw ID's digits, or ~0
+  const u32 len = raw_len(raw);
+  if ((raw & 0xFF) == '0' && len > 1) return ~0ull;  // a leading zero: not canonical
+  u64 v = 0;
+  u32 bad = 0;
+  for (u32 i = 0; i < len; i++) {
+    const u32 d = B36T[(raw >> (8 * i)) & 0xFF];
+    bad |= d, v = v * 36 + (d & 63);
+  }
+  return (bad & 64) ? ~0ull : v;
+}
+static AINLINE u64 zval(u64 raw) {  // (index * M1) ^ key, or ~0 for an ID that does not decode
+  if (!is_raw(raw)) return ~0ull;
+  const u64 x = b36_raw(raw);
+  if (x > SMASK) return ~0ull;
+  const u64 y = (x * SI2) & SMASK;
+  return (y ^ (y >> 17) ^ (y >> 34)) & SMASK;
+}
+static AINLINE u64 dindex(u64 raw, u64 key) {
+  const u64 z = zval(raw);
+  return z == ~0ull ? ~0ull : ((z ^ key) * SI1) & SMASK;
+}
+// With the event key known before parsing (g_dev), an event whose ID decodes
+// to an index below g_nv goes to partition index >> g_vsh and carries index + 1
+// in pad; any other goes by the hash of its ID with pad 0. Copies of an event
+// have the same ID, so they always meet in one partition.
+static bool g_dev = false;
+static int g_vsh = 0;
+static AINLINE u32 ev_part(u64 eid, int p1sh, u32& pad) {
+  if (g_dev) {
+    const u64 v = dindex(eid, g_ekey);
+    if (v < g_nv) {
+      pad = (u32)v + 1;
+      return (u32)(v >> g_vsh);
+    }
+  }
+  pad = 0;
+  return (u32)(hash64(eid) >> p1sh);
+}
+
 // ---------------------------------------------------------------- events
 static NOINLINE void slow_event(TC& tc, const char* s, const char* e) {
   tc.n_slow++;
@@ -1152,7 +1206,8 @@ static NOINLINE void slow_event(TC& tc, const char* s, const char* e) {
       r.pc = price << 8 | cat;
     }
   }
-  tc.evs.put((u32)(hash64(r.eid) >> (64 - g_p1bits)), &r);
+  const u32 part = ev_part(r.eid, 64 - g_p1bits, r.pad);
+  tc.evs.put(part, &r);
 }
 // A timestamp none of the fast forms took, as ms from WS; negative when bad or outside [WS, WE).
 static NOINLINE i64 ts_generic(const char* p, u32 n, i64 lo, i64 hi) {
@@ -1227,11 +1282,11 @@ static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char
   } else {
     valid = false;
   }
-  if (UNLIKELY(valid && (u64)rel < (u64)DAYMS && is_target(uid))) tc.esamp.push_back({uid, eid, (u32)rel, 0});
-  const u32 p = (u32)(hash64(eid) >> p1sh);
+  u32 pad;
+  const u32 p = ev_part(eid, p1sh, pad);
   u32 f = fill[p];
   Ev* d = (Ev*)(wc + (size_t)p * 128 + f);
-  d->eid = eid, d->uid = uid, d->ts = valid ? (u32)rel : TS_INVALID, d->ingest = ikey, d->pc = pc, d->pad = 0;
+  d->eid = eid, d->uid = uid, d->ts = valid ? (u32)rel : TS_INVALID, d->ingest = ikey, d->pc = pc, d->pad = pad;
   f += 32;
   if (UNLIKELY(f == 128)) {
     tc.evs.flush(p, 128);
@@ -1594,46 +1649,6 @@ static void do_links(TC& tc) {
 // for any key, so the index is a perfect hash; IDs that do not decode, people
 // whose rows are not one ordered run, and anything else unusual go through the
 // general pipeline unchanged.
-static const u64 SMASK = (1ull << 40) - 1;
-static const u64 SM1 = 0x9E3779B97F4Bull, SM2 = 0xD6E8FEB86659ull;
-static u64 SI1 = 0, SI2 = 0;
-static bool g_dense = false;
-static u64 g_ekey = 0, g_ckey = 0, g_nv = 0, g_nw = 0;
-static Ev2* g_E = nullptr;
-static Ck* g_C = nullptr;
-static u64 inv_odd(u64 a) {  // inverse modulo 2^64 of an odd number
-  u64 x = a;
-  for (int i = 0; i < 6; i++) x *= 2 - a * x;
-  return x;
-}
-static AINLINE u64 b36_raw(u64 raw) {  // the canonical base-36 value of a raw ID's digits, or ~0
-  const u32 len = raw_len(raw);
-  if ((raw & 0xFF) == '0' && len > 1) return ~0ull;  // a leading zero: not canonical
-  u64 v = 0;
-  for (u32 i = 0; i < len; i++) {
-    const u32 c = (u32)(raw >> (8 * i)) & 0xFF;
-    u32 d;
-    if (c - '0' < 10u)
-      d = c - '0';
-    else if (c - 'a' < 26u)
-      d = c - 'a' + 10;
-    else
-      return ~0ull;
-    v = v * 36 + d;
-  }
-  return v;
-}
-static AINLINE u64 zval(u64 raw) {  // (index * M1) ^ key, or ~0 for an ID that does not decode
-  if (!is_raw(raw)) return ~0ull;
-  const u64 x = b36_raw(raw);
-  if (x > SMASK) return ~0ull;
-  const u64 y = (x * SI2) & SMASK;
-  return (y ^ (y >> 17) ^ (y >> 34)) & SMASK;
-}
-static AINLINE u64 dindex(u64 raw, u64 key) {
-  const u64 z = zval(raw);
-  return z == ~0ull ? ~0ull : ((z ^ key) * SI1) & SMASK;
-}
 // The key, from pairs of IDs whose indices differ by less than S: low bits
 // first, keeping the candidates most pairs agree with.
 static bool recover_key(const vector<std::pair<u64, u64>>& pr, const vector<u64>& zs, u64 S, double frac, u64 limit, u64& key) {
@@ -1792,6 +1807,7 @@ static void phase2_partition(TC& tc, u32 p) {
   const u64 mask = cap - 1;
   const int shift = 64 - g_p1bits - sb;
   const size_t nseg = tc.segs.size();
+  const bool dpart = g_dev && ((u64)p << g_vsh) < g_nv;  // this partition holds an index range
   const double tp0 = VERBOSE ? now_ms() : 0;
   // Pass 1: find every event_id's copies; all but the one ingested first lose their ts.
   static_assert((BLK - BLKH) / sizeof(Ev) <= 256, "a record's index in its block fits a byte");
@@ -1799,7 +1815,13 @@ static void phase2_partition(TC& tc, u32 p) {
     // Slots of four bytes, so that the table stays in cache: 16 bits of the
     // hash, then the record as (its block + 1, its index in the block).
     u32* const tab = (u32*)tc.dtab;
-    memset(tab, 0, cap * 4);
+    bool tab_ready = false;
+    if (dpart) {
+      if (!tc.darr) tc.darr = (u32*)malloc(((size_t)4) << g_vsh);
+      memset(tc.darr, 0, ((size_t)4) << g_vsh);
+    }
+    u32* const da = tc.darr;
+    const u32 vbase = (u32)((u64)p << g_vsh) + 1;  // pad of the range's first index
     const auto* const segs = tc.segs.data();
     for (size_t si = 0; si < nseg; si++) {
       Ev* const base = segs[si].first;
@@ -1807,6 +1829,24 @@ static void phase2_partition(TC& tc, u32 p) {
       const u32 where = (u32)(si + 1) << 8;
       for (u32 j = 0; j < n; j++) {
         Ev* const r = base + j;
+        const u32 enc0 = where | j;
+        if (r->pad) {  // copies of one event share the slot of its index
+          const u32 k = r->pad - vbase;
+          const u32 s = da[k];
+          if (LIKELY(!s)) {
+            da[k] = enc0;
+          } else {
+            Ev* q = segs[(s >> 8) - 1].first + (s & 0xFF);
+            if (r->ingest < q->ingest) {
+              q->ts = TS_INVALID;
+              da[k] = enc0;
+            } else {
+              r->ts = TS_INVALID;
+            }
+          }
+          continue;
+        }
+        if (UNLIKELY(!tab_ready)) memset(tab, 0, cap * 4), tab_ready = true;
         const u64 h = hash64(r->eid);
         u64 i = (h >> shift) & mask;
         const u32 tag = (u32)(h >> (shift - 16)) & 0xFFFF;
@@ -1882,13 +1922,11 @@ static void phase2_partition(TC& tc, u32 p) {
       const u32 ts = r[j].ts;
       if (UNLIKELY(ts == TS_INVALID)) continue;
       const u64 uid = r[j].uid;
-      if (g_dense) {
-        const u64 v = dindex(r[j].eid, g_ekey);
-        if (v < g_nv) {
-          g_E[v].uid = uid, g_E[v].tspc = ((u64)ts << 32) | r[j].pc;
-          if (v > tc.vmax) tc.vmax = v;
-          continue;
-        }
+      if (g_dense && r[j].pad) {
+        const u64 v = r[j].pad - 1;
+        g_E[v].uid = uid, g_E[v].tspc = ((u64)ts << 32) | r[j].pc;
+        if (v > tc.vmax) tc.vmax = v;
+        continue;
       }
       const u32 q = (u32)(hash64(uid) >> sh2);
       u32 f = fill[q];
@@ -2816,30 +2854,68 @@ int main(int argc, char** argv) {
   const u32 P1 = 1u << g_p1bits, P2 = 1u << g_p2bits;
   g_tc.resize(NT);
   SI1 = inv_odd(SM1) & SMASK, SI2 = inv_odd(SM2) & SMASK;
-  if (!getenv("NODENSE") && !ev_files.empty()) {  // the busiest user IDs in a sample of the biggest event file
-    const MFile* big = &ev_files[0];
-    for (auto& f : ev_files)
-      if (f.n > big->n) big = &f;
-    const char* s0 = big->p;
-    const char* e0 = s0 + std::min<size_t>(big->n, 4u << 20);
-    std::unordered_map<u64, u32> cnt;
-    const char* ls = (const char*)memchr(s0, '\n', e0 - s0);
-    while (ls && ls + 1 < e0) {
-      const char* a = ls + 1;
-      const char* b = (const char*)memchr(a, '\n', e0 - a);
-      if (!b) break;
-      const char* fp[7];
-      u32 fl[7];
-      if (split(a, b, 7, fp, fl) && fl[1] > 0) cnt[id_key(fp[1], fl[1], 'u')]++;
-      ls = b;
+  for (int c = 0; c < 256; c++) B36T[c] = c >= '0' && c <= '9' ? (u8)(c - '0') : c >= 'a' && c <= 'z' ? (u8)(c - 'a' + 10) : 64;
+  if (!getenv("NODENSE") && !ev_files.empty()) {
+    // The event key, from the first 512 KB of the biggest event files: one
+    // user ID's events less than 10 s apart are nearly always in one session,
+    // a few indices apart.
+    vector<const MFile*> big;
+    for (auto& f : ev_files) big.push_back(&f);
+    std::sort(big.begin(), big.end(), [](const MFile* a, const MFile* b) { return a->n > b->n; });
+    big.resize(std::min<size_t>(big.size(), 8));
+    struct PS {
+      u64 uid;
+      i64 ts;
+      u64 z;
+    };
+    vector<vector<PS>> got(big.size());
+    parallel(std::min<int>(NT, (int)big.size()), [&](int t) {
+      for (size_t fi = (size_t)t; fi < big.size(); fi += (size_t)std::min<int>(NT, (int)big.size())) {
+        const char* s0 = big[fi]->p;
+        const char* e0 = s0 + std::min<size_t>(big[fi]->n, 512u << 10);
+        const char* ls = (const char*)memchr(s0, '\n', e0 - s0);
+        while (ls && ls + 1 < e0) {
+          const char* a = ls + 1;
+          const char* b = (const char*)memchr(a, '\n', e0 - a);
+          if (!b) break;
+          ls = b;
+          const char* fp[7];
+          u32 fl[7];
+          if (!split(a, b, 7, fp, fl)) continue;
+          if (fl[0] < 2 || fl[0] > 9 || fp[0][0] != 'e' || fl[1] < 2 || fl[1] > 9 || fp[1][0] != 'u') continue;
+          u64 ek = 0, uk = 0;
+          memcpy(&ek, fp[0] + 1, fl[0] - 1), memcpy(&uk, fp[1] + 1, fl[1] - 1);
+          i64 ts;
+          if (!parse_ts(fp[2], fl[2], ts)) continue;
+          const u64 z = zval(ek);
+          if (z != ~0ull) got[fi].push_back({uk, ts, z});
+        }
+      }
+    });
+    vector<PS> all;
+    for (auto& v : got) all.insert(all.end(), v.begin(), v.end());
+    std::sort(all.begin(), all.end(), [](const PS& x, const PS& y) { return x.uid != y.uid ? x.uid < y.uid : x.ts != y.ts ? x.ts < y.ts : x.z < y.z; });
+    vector<std::pair<u64, u64>> ep;
+    vector<u64> ez;
+    for (size_t i = 0; i + 1 < all.size(); i++)
+      if (all[i].uid == all[i + 1].uid && all[i + 1].ts - all[i].ts < 10000 && all[i].z != all[i + 1].z) ep.push_back({all[i].z, all[i + 1].z});
+    if (ep.size() > 600) {
+      vector<std::pair<u64, u64>> w;
+      for (size_t i = 0; i < 600; i++) w.push_back(ep[i * ep.size() / 600]);
+      ep.swap(w);
     }
-    vector<std::pair<u32, u64>> top;
-    for (auto& [k, c] : cnt) top.push_back({c, k});
-    std::sort(top.begin(), top.end(), [](auto& x, auto& y) { return x.first > y.first; });
-    for (size_t i = 0; i < top.size() && g_ntgt < 4 && top[i].first >= 20; i++) {
-      g_tgt[g_ntgt++] = top[i].second;
-      g_tmask |= 1ull << (hash64(top[i].second) >> 58);
+    for (size_t i = 0; i < all.size(); i++) ez.push_back(all[i].z);
+    const u64 loose = ev_bytes / 24 + 1024;  // no event line is shorter than 24 bytes
+    if (recover_key(ep, ez, 64, 0.75, loose, g_ekey)) {
+      u64 mx = 0;
+      for (u64 z : ez) mx = std::max(mx, ((z ^ g_ekey) * SI1) & SMASK);
+      g_nv = std::min<u64>(loose, mx + mx / 50 + 4096);  // indices past it just take the general path
+      g_vsh = 0;
+      while (((g_nv - 1) >> g_vsh) >= P1) g_vsh++;
+      g_dev = true;
+      g_ntgt = 1;  // sample clicks for the click key
     }
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] event key %s: %zu samples, %zu pairs, nv %llu, range %u\n", now_ms(), g_dev ? "ok" : "no", all.size(), ep.size(), (unsigned long long)g_nv, 1u << g_vsh);
   }
   tick("mapped");
 #ifdef __linux__
@@ -2933,8 +3009,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[%8.1f ms] parsed: %llu lines, %llu slow, P1=%u P2=%u\n", now_ms(), (unsigned long long)lines, (unsigned long long)slow, P1, P2);
   }
 
-  // ---- dense indices: recover the ID scramble keys from the samples
-  if (g_ntgt) {
+  // ---- dense indices: the click key from the samples
+  if (g_dev) {
     vector<TC::Samp> es, cs;
     for (auto* tc : g_tc) es.insert(es.end(), tc->esamp.begin(), tc->esamp.end()), cs.insert(cs.end(), tc->csamp.begin(), tc->csamp.end());
     auto byut = [](const TC::Samp& x, const TC::Samp& y) { return x.uid != y.uid ? x.uid < y.uid : x.ts != y.ts ? x.ts < y.ts : x.id < y.id; };
@@ -2974,9 +3050,17 @@ int main(int argc, char** argv) {
       const u64 z = zval(cs[i].id);
       if (z != ~0ull) cz.push_back(z);
     }
-    g_nv = ev_bytes / 32 + 1024, g_nw = ck_bytes / 24 + 1024;
-    const bool ek = recover_key(ep, ez, 64, 0.75, g_nv, g_ekey);
-    const bool ck = ek && recover_key(cp, cz, 64, 0.8, g_nw, g_ckey);
+    const u64 cloose = ck_bytes / 16 + 1024;  // no click line is shorter than 16 bytes
+    const bool ek = true;
+    const bool ck = recover_key(cp, cz, 64, 0.8, cloose, g_ckey);
+    if (ck) {
+      u64 mx = 0;
+      for (const auto& c : cs) {
+        const u64 z = zval(c.id);
+        if (z != ~0ull) mx = std::max(mx, ((z ^ g_ckey) * SI1) & SMASK);
+      }
+      g_nw = std::min<u64>(cloose, mx + mx / 50 + 4096);
+    }
     g_dense = ek && ck;
     if (g_dense) {
       g_E = (Ev2*)big_alloc(g_nv * sizeof(Ev2));
