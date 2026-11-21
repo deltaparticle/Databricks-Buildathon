@@ -1202,7 +1202,7 @@ static u32 stage2_clicks(TC& tc, const char* T, u32 nnl, u32 maxstart) {
     if (REGULAR(4) && LIKELY((r = fast_click(T, sp, nl, tmp[nt])) >= 0)) {
       sp += 4;
       if (r) {
-        __builtin_prefetch(&g_ids[id_index(tmp[nt].uid)]);
+        __builtin_prefetch(&g_afilt[afilt_word(mix(tmp[nt].uid))]);
         if (++nt == 64) {
           for (u32 k = 0; k < 64; k++) emit_click(tc, tmp[k].cid, tmp[k].uid, tmp[k].ts, tmp[k].camp);
           nt = 0;
