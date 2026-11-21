@@ -1281,10 +1281,12 @@ struct CkTmp {
 };
 // A click goes to the partition of its user ID, as an event does.
 static AINLINE void emit_click(TC& tc, u64 cid, u64 uid, u32 ts, u32 camp) {
-  if (UNLIKELY(ts - SEVEN_MS < (u32)DAYMS && is_target(uid))) tc.csamp.push_back({uid, cid, ts, 0});
+  const u64 h = hash64(uid);
+  // Every click of 1 in 128 user IDs is sampled, for the click scramble key.
+  if (UNLIKELY(((h >> 20) & 127) == 0 && g_ntgt)) tc.csamp.push_back({uid, cid, ts, 0});
   Ck r;
   r.uid = uid, r.cid = cid, r.ts = ts, r.camp = camp;
-  tc.cks.put((u32)(hash64(uid) >> (64 - g_p2bits)), &r);
+  tc.cks.put((u32)(h >> (64 - g_p2bits)), &r);
 }
 static NOINLINE void slow_click(TC& tc, const char* s, const char* e) {
   tc.n_slow++;
@@ -2932,7 +2934,6 @@ int main(int argc, char** argv) {
     for (auto* tc : g_tc) es.insert(es.end(), tc->esamp.begin(), tc->esamp.end()), cs.insert(cs.end(), tc->csamp.begin(), tc->csamp.end());
     auto byut = [](const TC::Samp& x, const TC::Samp& y) { return x.uid != y.uid ? x.uid < y.uid : x.ts != y.ts ? x.ts < y.ts : x.id < y.id; };
     std::sort(es.begin(), es.end(), byut);
-    std::sort(cs.begin(), cs.end(), byut);
     vector<std::pair<u64, u64>> ep, cp;
     vector<u64> ez, cz;
     for (size_t i = 0; i + 1 < es.size(); i++)
@@ -2940,11 +2941,19 @@ int main(int argc, char** argv) {
         const u64 a = zval(es[i].id), b = zval(es[i + 1].id);
         if (a != ~0ull && b != ~0ull) ep.push_back({a, b});
       }
-    for (size_t i = 0; i + 1 < cs.size(); i++)  // clicks at the same millisecond come in index pairs
-      if (cs[i].uid == cs[i + 1].uid && cs[i].ts == cs[i + 1].ts && cs[i].id != cs[i + 1].id) {
-        const u64 a = zval(cs[i].id), b = zval(cs[i + 1].id);
-        if (a != ~0ull && b != ~0ull) cp.push_back({a, b});
-      }
+    // A user's clicks have one contiguous index range: pairs from user IDs with
+    // at most 8 sampled clicks are close in index.
+    std::sort(cs.begin(), cs.end(), [](const TC::Samp& x, const TC::Samp& y) { return x.uid != y.uid ? x.uid < y.uid : x.id < y.id; });
+    for (size_t i = 0, j; i < cs.size(); i = j) {
+      vector<u64> zz;
+      for (j = i; j < cs.size() && cs[j].uid == cs[i].uid; j++)
+        if (j == i || cs[j].id != cs[j - 1].id) {
+          const u64 z = zval(cs[j].id);
+          if (z != ~0ull) zz.push_back(z);
+        }
+      if (zz.size() >= 2 && zz.size() <= 8)
+        for (size_t k = 0; k + 1 < zz.size(); k++) cp.push_back({zz[k], zz[k + 1]});
+    }
     auto thin = [](vector<std::pair<u64, u64>>& v, size_t k) {
       if (v.size() <= k) return;
       vector<std::pair<u64, u64>> w;
@@ -2962,7 +2971,7 @@ int main(int argc, char** argv) {
     }
     g_nv = ev_bytes / 32 + 1024, g_nw = ck_bytes / 24 + 1024;
     const bool ek = recover_key(ep, ez, 64, 0.75, g_nv, g_ekey);
-    const bool ck = ek && recover_key(cp, cz, 2, 0.5, g_nw, g_ckey);
+    const bool ck = ek && recover_key(cp, cz, 64, 0.8, g_nw, g_ckey);
     g_dense = ek && ck;
     if (g_dense) {
       g_E = (Ev2*)big_alloc(g_nv * sizeof(Ev2));
