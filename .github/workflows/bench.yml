@@ -100,6 +100,32 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
+      - name: Parameter sweep (same binary, round-robin, same machine)
+        run: |
+          declare -A CFG=(
+            [default]=""
+            [P8]="SHOP_P_BITS=8" [P10]="SHOP_P_BITS=10"
+            [Q6]="SHOP_Q_BITS=6" [Q8]="SHOP_Q_BITS=8"
+            [C512K]="SHOP_CHUNK_KB=512" [C8M]="SHOP_CHUNK_KB=8192"
+            [THP]="MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
+          )
+          rm -f sweep.txt
+          for i in 1 2 3; do
+            for name in "${!CFG[@]}"; do
+              /usr/bin/time -f "$name wall=%e user=%U" env ${CFG[$name]} DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./target/release/shopping 2>> sweep.txt
+            done
+          done
+          python3 - <<'PY'
+          import statistics as st, collections
+          d = collections.defaultdict(lambda: ([], []))
+          for l in open("sweep.txt"):
+              p = l.split()
+              if len(p) == 3 and p[1].startswith("wall="):
+                  d[p[0]][0].append(float(p[1][5:])); d[p[0]][1].append(float(p[2][5:]))
+          for k, (w, u) in sorted(d.items(), key=lambda kv: st.median(kv[1][0])):
+              print(f"{k:8s} median wall {st.median(w):.3f}s  user {st.median(u):.2f}s  n={len(w)}")
+          PY
+
       - name: Cold page cache (drop caches before each run)
         run: |
           drop() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
