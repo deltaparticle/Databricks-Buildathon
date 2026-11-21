@@ -484,28 +484,14 @@ struct IdSlot {
 static IdSlot* g_ids = nullptr;
 static u64 g_idcap = 0;
 static AINLINE u64 id_index(u64 key) { return mulhi(hash64(key), g_idcap); }
-// Only IDs that are not their person's name (aliases) are kept, in a compact
-// table behind a filter of two bits per alias in one 64-bit word: most IDs
-// (names, and IDs in no link) are answered by the cache-resident filter.
-static u64* g_afilt = nullptr;
-static u64 g_afmask = 0;
-static IdSlot* g_alias = nullptr;
-static u64 g_acap = 0;
-static AINLINE u64 afilt_word(u64 h) { return (h >> 20) & g_afmask; }
-static AINLINE u64 afilt_bits(u64 h) { return (1ull << (h & 63)) | (1ull << ((h >> 6) & 63)); }
-static AINLINE u64 alias_probe(u64 uid) {
-  u64 i = mulhi(hash64(uid), g_acap);
+static AINLINE u64 person_of(u64 uid) {
+  u64 i = id_index(uid);
   for (;;) {
-    const IdSlot& s = g_alias[i];
+    const IdSlot& s = g_ids[i];
     if (s.key == uid) return s.val;
     if (!s.key) return uid;
-    if (UNLIKELY(++i == g_acap)) i = 0;
+    if (UNLIKELY(++i == g_idcap)) i = 0;
   }
-}
-static AINLINE u64 person_of(u64 uid) {
-  const u64 h = mix(uid), b = afilt_bits(h);
-  if ((g_afilt[afilt_word(h)] & b) != b) return uid;
-  return alias_probe(uid);
 }
 
 // ---------------------------------------------------------------- memory
@@ -1202,7 +1188,7 @@ static u32 stage2_clicks(TC& tc, const char* T, u32 nnl, u32 maxstart) {
     if (REGULAR(4) && LIKELY((r = fast_click(T, sp, nl, tmp[nt])) >= 0)) {
       sp += 4;
       if (r) {
-        __builtin_prefetch(&g_afilt[afilt_word(mix(tmp[nt].uid))]);
+        __builtin_prefetch(&g_ids[id_index(tmp[nt].uid)]);
         if (++nt == 64) {
           for (u32 k = 0; k < 64; k++) emit_click(tc, tmp[k].cid, tmp[k].uid, tmp[k].ts, tmp[k].camp);
           nt = 0;
@@ -1442,26 +1428,6 @@ static void do_links(TC& tc) {
     if (i + PD < cap) __builtin_prefetch(&ids[ids[i + PD].val]);
     if (ids[i].key) ids[i].val = ids[ids[i].val].key;
   }
-  // The compact alias table and its filter.
-  u64 na = 0;
-  for (u64 i = 0; i < cap; i++) na += ids[i].key && ids[i].val != ids[i].key;
-  u64 words = 64;
-  while (words * 64 < na * 16) words <<= 1;
-  g_afilt = (u64*)big_alloc(words * 8);
-  g_afmask = words - 1;
-  g_acap = std::max<u64>(64, na * 2);
-  g_alias = (IdSlot*)big_alloc(g_acap * sizeof(IdSlot));
-  for (u64 i = 0; i < cap; i++) {
-    const u64 k = ids[i].key;
-    if (!k || ids[i].val == k) continue;
-    const u64 h = mix(k);
-    g_afilt[afilt_word(h)] |= afilt_bits(h);
-    u64 j = mulhi(hash64(k), g_acap);
-    while (g_alias[j].key) {
-      if (++j == g_acap) j = 0;
-    }
-    g_alias[j] = ids[i];
-  }
 }
 
 // ---------------------------------------------------------------- phase 2
@@ -1488,6 +1454,8 @@ static void phase2_partition(TC& tc, u32 p) {
   const u64 mask = cap - 1;
   const int shift = 64 - g_p1bits - sb;
   const u64 PTR = (1ull << 48) - 1;
+  const IdSlot* const ids = g_ids;
+  const u64 idcap = g_idcap;
   // Pass 1: find every event_id's copies; all but the one ingested first lose their ts.
   for (auto& sg : tc.segs) {
     Ev* r = sg.first;
@@ -1529,24 +1497,34 @@ static void phase2_partition(TC& tc, u32 p) {
     const Ev* const r = sg.first;
     const u32 n = sg.second;
     const u32 head = std::min(n, PD);
-    const u64* const filt = g_afilt;
     for (u32 j = 0; j < head; j++) {
-      const u64 h = mix(r[j].uid);
-      ring[j] = h;
-      __builtin_prefetch(&filt[afilt_word(h)]);
+      const u64 i = mulhi(hash64(r[j].uid), idcap);
+      ring[j] = i;
+      __builtin_prefetch(&ids[i]);
     }
     for (u32 j = 0; j < n; j++) {
-      const u64 h = ring[j & (PD - 1)];
+      u64 i = ring[j & (PD - 1)];
       if (LIKELY(j + PD < n)) {
-        const u64 nx = mix(r[j + PD].uid);
+        const u64 nx = mulhi(hash64(r[j + PD].uid), idcap);
         ring[j & (PD - 1)] = nx;
-        __builtin_prefetch(&filt[afilt_word(nx)]);
+        __builtin_prefetch(&ids[nx]);
       }
       const u32 ts = r[j].ts;
       if (UNLIKELY(ts == TS_INVALID)) continue;
       const u64 uid = r[j].uid;
-      const u64 fb = afilt_bits(h);
-      const u64 person = (filt[afilt_word(h)] & fb) != fb ? uid : alias_probe(uid);
+      u64 person;
+      for (;;) {
+        const IdSlot& sl = ids[i];
+        if (sl.key == uid) {
+          person = sl.val;
+          break;
+        }
+        if (LIKELY(!sl.key)) {
+          person = uid;
+          break;
+        }
+        if (UNLIKELY(++i == idcap)) i = 0;
+      }
       const u32 q = (u32)(hash64(person) >> sh2);
       char* w = wp[q];
       Ev2* d = (Ev2*)w;
