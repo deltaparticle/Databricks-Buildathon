@@ -52,11 +52,12 @@ jobs:
       - name: Tools
         run: |
           sudo apt-get update -qq >/dev/null 2>&1 || true
-          sudo apt-get install -y -qq bolt-18 >/dev/null 2>&1 || true
+          lsb_release -ds; apt-cache search --names-only '^bolt-[0-9]+$' | sort
+          for v in 22 21 20 19 18; do sudo apt-get install -y -qq bolt-$v >/dev/null 2>&1 && { echo "BOLT=/usr/lib/llvm-$v/bin/llvm-bolt" >> $GITHUB_ENV; echo "installed bolt-$v"; break; }; done
+          sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
           sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}; echo "PERF=$PERF" >> $GITHUB_ENV
           rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1
-          rustup toolchain install nightly --profile minimal --target x86_64-unknown-linux-musl >/dev/null 2>&1 || true
           pip install --quiet polars
       - name: Data
         run: |
@@ -77,12 +78,8 @@ jobs:
           b bin-base2 $M ""
           b relocs $M "$R"
           b grelocs $G "$R"
-          b bin-gstatic $G "-C target-feature=+crt-static"
-          b bin-p512 $M "-C target-feature=-prefer-256-bit"
-          b bin-nightly $M "" +nightly
-          (cd lane && RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static" CARGO_TARGET_DIR=/tmp/t-nojcc cargo build --release -q --target $M) && cp /tmp/t-nojcc/$M/release/pipeline ./bin-nojcc
+          b ginstsrc $G "$R --cfg bolt_instr"
           cp grelocs bin-gdyn
-          rustc +nightly --version || true
           ls -l bin-* relocs grelocs
       - name: Counters
         run: |
@@ -93,38 +90,50 @@ jobs:
           done
       - name: BOLT
         run: |
-          BOLT=/usr/lib/llvm-18/bin/llvm-bolt; [ -x $BOLT ] || exit 0
-          $BOLT --version | head -2
+          [ -n "$BOLT" ] && [ -x "$BOLT" ] || exit 0
+          $BOLT --version | head -3
+          echo "== hot code size (largest functions, bytes)"; nm -S --size-sort -C ./relocs | tail -12
           tr() { b=$1; for i in 1 2 3 4 5 6 7 8; do DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) $b >/dev/null 2>&1; done; }
           export -f tr; export RUNNER_TEMP
-          # 1. sampled profile of the musl static binary (LBR if the VM has it)
-          if $PERF record -e cycles:u -j any,u -o lbr.data -- bash -c "tr ./relocs" 2>lbr.err; then
-            echo "LBR=1"; $BOLT ./relocs -p lbr.data -o prof.fdata -aggregate-only 2>&1 | grep -E "BOLT-(INFO|WARNING|ERROR)" | tail -6
-          else
-            tail -1 lbr.err; echo "LBR=0"
-            $PERF record -F 20000 -o nl.data -- bash -c "tr ./relocs" 2>&1 | tail -1
-            $BOLT ./relocs -p nl.data -o prof.fdata -aggregate-only -nl 2>&1 | grep -E "BOLT-(INFO|WARNING|ERROR)" | tail -6
-          fi
-          ls -l prof.fdata; head -c 300 prof.fdata; echo
-          # 2. exact edge profile via BOLT instrumentation (glibc dynamic build; static binaries can't dump at exit)
-          $BOLT ./grelocs -instrument -instrumentation-file=$PWD/inst.fdata -o ./ginst 2>&1 | grep -E "BOLT-(WARNING|ERROR)" | tail -4
+          agg() {  # binary, out fdata
+            if $PERF record -e cycles:u -j any,u -o lbr.data -- bash -c "tr $1" 2>/dev/null >/dev/null; then
+              echo "LBR=1"; $BOLT $1 -p lbr.data -o $2 -aggregate-only 2>&1 | grep -E "BOLT-(ERROR)" | tail -3
+            else
+              echo "LBR=0"; $PERF record -F 20000 -o nl.data -- bash -c "tr $1" 2>&1 | tail -1
+              $BOLT $1 -p nl.data -o $2 -aggregate-only -nl 2>&1 | grep -E "BOLT-(ERROR)" | tail -3
+            fi
+            ls -l $2
+          }
+          agg ./relocs prof.fdata
+          agg ./grelocs gprof.fdata
+          # exact edge counts: BOLT instrumentation of a glibc build that leaves via exit() (--cfg bolt_instr)
+          $BOLT ./ginstsrc -instrument -instrumentation-file=$PWD/inst.fdata -o ./ginst 2>&1 | grep -E "BOLT-(ERROR)" | tail -4
           DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./ginst >/dev/null 2>&1; echo "instrumented run exit=$?"; ls -l inst.fdata || true
           bo() {  # out, in, profile, opts...
             o=$1; i=$2; d=$3; shift 3
-            $BOLT $i -o ./$o -data=$d "$@" 2>&1 | grep -E "BOLT-(INFO|WARNING|ERROR)" | grep -E "ERROR|WARNING|profile|stale|hot|split|reorder|functions" | head -14 || true
+            $BOLT $i -o ./$o -data=$d "$@" > bo-$o.log 2>&1
+            grep -E "BOLT-(INFO|WARNING|ERROR)" bo-$o.log | grep -vE "AVX512 instruction" | grep -E "ERROR|WARNING|profile|stale|non-simple|ignored|split|functions" | head -10 || true
+            echo "AVX512 encoding warnings: $(grep -c 'AVX512 instruction' bo-$o.log)"
             [ -x ./$o ] && echo "== bolt $o ok" || echo "== bolt $o FAILED"
           }
           STD="-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -icf=1 -use-gnu-stack -dyno-stats"
           bo bin-bolt_a ./relocs prof.fdata $STD
+          grep -A3 -m3 "AVX512 instruction" bo-bin-bolt_a.log || true
           bo bin-bolt_b ./relocs prof.fdata -reorder-blocks=ext-tsp -reorder-functions=cdsort -use-gnu-stack
+          bo bin-bolt_nr ./relocs prof.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
           bo bin-bolt_c ./relocs prof.fdata $STD -x86-align-branch-boundary-hot-only -x86-branches-within-32B-boundaries
-          bo bin-bolt_d ./relocs prof.fdata $STD -align-blocks -peepholes=all -frame-opt=hot -inline-small-functions
+          bo bin-gbolt_s ./grelocs gprof.fdata $STD
+          bo bin-gbolt_snr ./grelocs gprof.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
           if [ -s inst.fdata ]; then
             bo bin-gbolt_i ./grelocs inst.fdata $STD
             bo bin-gbolt_ic ./grelocs inst.fdata $STD -x86-align-branch-boundary-hot-only -x86-branches-within-32B-boundaries
-            bo bin-bolt_mi ./relocs inst.fdata $STD -infer-stale-profile
           fi
           ls -l bin-*
+          # where do the bolted binaries crash?
+          for f in bin-bolt_a bin-bolt_nr bin-gbolt_s; do [ -x $f ] || continue
+            echo "== gdb $f"
+            DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) timeout 120 gdb -q -batch -ex run -ex bt -ex 'x/4i $pc' ./$f 2>&1 | grep -E "SIGSEGV|SIGILL|SIGBUS|^#[0-9]|=>|exited" | head -12 || true
+          done
       - name: Exact checks vs shipped build (timing set, seed 42)
         run: |
           a=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) ./bin-base

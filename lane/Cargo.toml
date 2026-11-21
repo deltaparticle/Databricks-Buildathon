@@ -19,4 +19,4 @@ panic = "abort"
 debug = false
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pgo_gen)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pgo_gen)", "cfg(bolt_instr)"] }

@@ -49,6 +49,15 @@ pub fn pgo_flush() {
         }
         unsafe { __llvm_profile_write_file() };
     }
+    // BOLT instrumentation training run: leave through libc exit() so the
+    // instrumentation runtime's fini hook dumps the profile.
+    #[cfg(bolt_instr)]
+    {
+        extern "C" {
+            fn exit(code: i32) -> !;
+        }
+        unsafe { exit(0) }
+    }
 }
 
 pub fn run_generic(data: &str, out: &str, ncpu: usize) -> ! {
