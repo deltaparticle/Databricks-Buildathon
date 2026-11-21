@@ -22,6 +22,10 @@ on:
         description: "Parallel jobs (JSON list)"
         required: false
         default: '["a","b"]'
+      cpu:
+        description: "intel = fail (for re-run) on non-Intel runners; any = accept AVX-512 AMD too"
+        required: false
+        default: "intel"
 
 permissions:
   contents: read
@@ -42,6 +46,7 @@ jobs:
           for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
             grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
           done
+          if [ "${{ github.event.inputs.cpu }}" = intel ] && ! grep -q GenuineIntel /proc/cpuinfo; then echo "::error::runner is not Intel; re-run the job"; exit 1; fi
       - name: Data
         run: |
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
