@@ -38,7 +38,6 @@ const P: usize = 1 << P_BITS;
 const Q_BITS: u32 = 7;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
-const CLICK_SLICES: usize = 4;
 const CHUNK: usize = 2 << 20;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
@@ -424,7 +423,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut Sink<Ev>, tsc: &mut ts::
 }
 
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>, tsc: &mut ts::DateCache) {
+fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>, tsc: &mut ts::DateCache) {
     if f[0].is_empty() || f[1].is_empty() {
         return;
     }
@@ -433,7 +432,11 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>, tsc: &mut ts::DateC
         return;
     }
     let Some(camp) = ctx.campaigns.get(f[2]) else { return };
-    out.push(Cl { ukey: keys::key(f[1]), ckey: keys::key(f[0]), ts: (t - ctx.cws) as u32, camp });
+    let ukey = keys::key(f[1]);
+    let h = mix(ukey);
+    let person = aliases.person(ukey, h);
+    let ph = if person == ukey { h } else { mix(person) };
+    out.push(part(ph, Q_BITS), PCl { person, ckey: keys::key(f[0]), ts: (t - ctx.cws) as u32, camp });
 }
 
 /// Every linked ID that is not its person's name -> the name. A bitmap in
@@ -704,12 +707,12 @@ struct P1<'r> {
     tsc: ts::DateCache,
     prof: [f64; 2],
     ev: Sink<'r, Ev>,
-    cl: Vec<Cl>,
+    /// Clicks, already resolved to their person and partitioned by person.
+    pc: Sink<'r, PCl>,
 }
 
 struct P2<'r> {
     pe: Sink<'r, PEv>,
-    pc: Sink<'r, PCl>,
     seen: Vec<u64>,
     coll: Vec<u64>,
     dups: SmallIndex,
@@ -1019,22 +1022,27 @@ fn main() {
     let n_event_chunks = event_chunks.len();
     let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
     let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
-    // Rows are ~78 (events) and ~47 (clicks) bytes; reserve with headroom.
-    let est_events = event_bytes / 70 + 1024;
-    let est_clicks = click_bytes / 40 + 1024;
     let ev_region = Region::new(event_bytes / 32 * std::mem::size_of::<Ev>() + Sink::<Ev>::slack(P) * threads);
     let pe_region = Region::new(event_bytes / 32 * std::mem::size_of::<PEv>() + Sink::<PEv>::slack(Q) * threads);
     let pc_region = Region::new(click_bytes / 24 * std::mem::size_of::<PCl>() + Sink::<PCl>::slack(Q) * threads);
     lap("setup");
 
     // Phase 1: parse.
-    let (p1, aliases) = thread::scope(|scope| {
+    let aliases_cell: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
+    let p1 = thread::scope(|scope| {
         #[cfg(unix)]
         {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
             scope.spawn(move || readahead_all(&all));
         }
-        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.keys.iter().filter(|&&k| k != EMPTY).count()); } a });
+        scope.spawn(|| {
+            let t = Instant::now();
+            let a = build_aliases(&link_paths);
+            if profile {
+                eprintln!("links built in {:.3}s", t.elapsed().as_secs_f64());
+            }
+            let _ = aliases_cell.set(a);
+        });
         let p1 = pool_finish(
             threads,
             n_event_chunks + click_chunks.len(),
@@ -1042,7 +1050,7 @@ fn main() {
                 tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
                 ev: Sink::new(&ev_region, P),
-                cl: Vec::with_capacity(est_clicks / threads * 5 / 4),
+                pc: Sink::new(&pc_region, Q),
             },
             |st, t| {
                 let tt = Instant::now();
@@ -1053,15 +1061,19 @@ fn main() {
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice = &click_files[fi][a..b];
-                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl, &mut st.tsc));
+                    let aliases = aliases_cell.wait();
+                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, aliases, &mut st.pc, &mut st.tsc));
                 }
                 st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },
-            |st, _| st.ev.finish(),
+            |st, _| {
+                st.ev.finish();
+                st.pc.finish();
+            },
         );
-        let aliases = links.join().unwrap();
-        (p1, aliases)
+        p1
     });
+    let aliases = aliases_cell.into_inner().expect("links");
     if profile {
         let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
         let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();
@@ -1070,13 +1082,11 @@ fn main() {
     lap("parse");
 
     // Phase 2: dedup events, route events and clicks by person.
-    let nw = p1.len();
     let p2 = pool_finish(
         threads,
-        CLICK_SLICES * nw + P,
+        P,
         || P2 {
             pe: Sink::new(&pe_region, Q),
-            pc: Sink::new(&pc_region, Q),
             seen: Vec::new(),
             coll: Vec::new(),
             dups: SmallIndex::new(1024),
@@ -1084,18 +1094,6 @@ fn main() {
             prof: [0.0; 4],
         },
         |st, t| {
-            // Click routing first (big tasks), then the event_id partitions.
-            if t < CLICK_SLICES * nw {
-                let all = &p1[t / CLICK_SLICES].cl;
-                let k = t % CLICK_SLICES;
-                let cl = &all[all.len() * k / CLICK_SLICES..all.len() * (k + 1) / CLICK_SLICES];
-                for &c in cl {
-                    let person = aliases.person(c.ukey, mix(c.ukey));
-                    st.pc.push(part(mix(person), Q_BITS), PCl { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
-                }
-                return;
-            }
-            let t = t - CLICK_SLICES * nw;
             let tt = Instant::now();
             let n: usize = p1.iter().map(|w| w.ev.len(t)).sum();
             if n == 0 {
@@ -1155,10 +1153,7 @@ fn main() {
             }
             st.prof[1] += tt.elapsed().as_secs_f64();
         },
-        |st, _| {
-            st.pe.finish();
-            st.pc.finish();
-        },
+        |st, _| st.pe.finish(),
     );
     if profile {
         let mut tot = [0.0; 4];
@@ -1169,7 +1164,7 @@ fn main() {
         }
         eprintln!("dedup cpu: bitmap {:.3} emit {:.3}", tot[0], tot[1]);
     }
-    std::mem::forget(p1); // freed at exit; freeing here would stall the critical path
+    // p1 stays alive: its click sinks feed phase 3. Nothing is freed until exit.
     lap("dedup");
 
     // Phase 3: group by person, sessions, attribution, aggregation. Each
@@ -1182,7 +1177,9 @@ fn main() {
     let ncamp = ctx.camp_ids.len();
     // Largest person partitions first, so no thread is left with a big tail.
     let mut order: Vec<usize> = (0..Q).collect();
-    order.sort_by_key(|&q| std::cmp::Reverse(p2.iter().map(|w| w.pe.len(q) + w.pc.len(q)).sum::<usize>()));
+    order.sort_by_key(|&q| {
+        std::cmp::Reverse(p2.iter().map(|w| w.pe.len(q)).sum::<usize>() + p1.iter().map(|w| w.pc.len(q)).sum::<usize>())
+    });
     let p3 = pool_finish(
         threads,
         Q,
@@ -1254,7 +1251,7 @@ fn main() {
             st.coff.resize(np + 1, 0);
             st.eidx.clear();
             let mut nc = 0usize;
-            for w in &p2 {
+            for w in &p1 {
                 for c in w.pc.slices(q).flatten() {
                     match st.index.get(c.person) {
                         Some(i) => {
@@ -1278,7 +1275,7 @@ fn main() {
             {
                 let mut cursor: Vec<u32> = st.coff[..np].to_vec();
                 let mut k = 0;
-                for w in &p2 {
+                for w in &p1 {
                     for c in w.pc.slices(q).flatten() {
                         let i = st.eidx[k];
                         k += 1;
@@ -1322,6 +1319,7 @@ fn main() {
         eprintln!("session cpu: group {:.3} sweep {:.3}", tot[0], tot[1]);
     }
     std::mem::forget(p2); // freed at exit
+    std::mem::forget(p1);
     lap("sessions");
 
     // Output: campaign_daily (user_daily files are already written).
