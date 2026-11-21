@@ -289,6 +289,31 @@ unsafe fn scatter_chunk12(p: *const u8, n: usize, slots: *mut Rec, gen: u64, nex
         let q0 = (e as *const u64).read_unaligned();
         let q1 = (e.add(12) as *const u64).read_unaligned();
         let s0 = slots.add((q0 & (BSIZE as u64 - 1)) as usize);
+        if BLESS == 2 {
+            // branchless: always store, the new record or the old slot back
+            let o0 = _mm_loadu_si128(s0 as *const __m128i);
+            let old0 = _mm_extract_epi64::<1>(o0) as u64;
+            let c0 = ((old0 as u16 != q0.wrapping_add(gen) as u16) | (((q0 >> 16) & ING_MAX) < ((old0 >> 16) & ING_MAX))) as u8;
+            _mm_storeu_si128(s0 as *mut __m128i, _mm_mask_mov_epi64(o0, c0.wrapping_neg() & 3, _mm256_castsi256_si128(r)));
+            let s1 = slots.add((q1 & (BSIZE as u64 - 1)) as usize);
+            let o1 = _mm_loadu_si128(s1 as *const __m128i);
+            let old1 = _mm_extract_epi64::<1>(o1) as u64;
+            let c1 = ((old1 as u16 != q1.wrapping_add(gen) as u16) | (((q1 >> 16) & ING_MAX) < ((old1 >> 16) & ING_MAX))) as u8;
+            _mm_storeu_si128(s1 as *mut __m128i, _mm_mask_mov_epi64(o1, c1.wrapping_neg() & 3, _mm256_extracti128_si256::<1>(r)));
+            return;
+        }
+        if BLESS == 1 {
+            // branchless: masked store (mask 0 = keep the old copy); the second
+            // record's load still follows the first store in program order
+            let old0 = (*s0).w1;
+            let c0 = ((old0 as u16 != q0.wrapping_add(gen) as u16) | (((q0 >> 16) & ING_MAX) < ((old0 >> 16) & ING_MAX))) as u8;
+            _mm_mask_storeu_epi64(s0 as *mut i64, c0.wrapping_neg() & 3, _mm256_castsi256_si128(r));
+            let s1 = slots.add((q1 & (BSIZE as u64 - 1)) as usize);
+            let old1 = (*s1).w1;
+            let c1 = ((old1 as u16 != q1.wrapping_add(gen) as u16) | (((q1 >> 16) & ING_MAX) < ((old1 >> 16) & ING_MAX))) as u8;
+            _mm_mask_storeu_epi64(s1 as *mut i64, c1.wrapping_neg() & 3, _mm256_extracti128_si256::<1>(r));
+            return;
+        }
         let old0 = (*s0).w1;
         if old0 as u16 != q0.wrapping_add(gen) as u16 || ((q0 >> 16) & ING_MAX) < ((old0 >> 16) & ING_MAX) {
             _mm_storeu_si128(s0 as *mut __m128i, _mm256_castsi256_si128(r));
@@ -425,6 +450,9 @@ unsafe fn sr_drain(buf: *mut u8, cnt: &mut [u32; SRP], slots: *mut Rec, gen: u64
         }
     }
 }
+// Dedup slot update in scatter_chunk12 (DEC2 path): 0 branch (shipped),
+// 1 masked store, 2 unconditional store of new-or-old.
+const BLESS: u32 = crate::env_u32(option_env!("XL_BLESS"), 0);
 // Hint of the next-chunk prefetch in scatter_chunk12: 0 T0 (shipped), 1 T1, 2 T2, 3 NTA.
 const CKH: u32 = crate::env_u32(option_env!("XL_CKH"), 0);
 #[inline(always)]
