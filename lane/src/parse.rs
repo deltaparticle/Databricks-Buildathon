@@ -696,6 +696,29 @@ impl EvPart {
         }
     }
     #[inline(always)]
+    pub fn for_each_raw_nx(&self, b: usize, mut f: impl FnMut(*const u8, usize, *const u8)) {
+        unsafe {
+            if b >= self.head.len() {
+                return;
+            }
+            let mut c = self.head[b];
+            if c.is_null() {
+                return;
+            }
+            let cur = self.cur[b] as usize;
+            let last = (cur - 1) & !(CHUNK - 1);
+            loop {
+                if c as usize == last {
+                    f(c as *const u8, (cur - last) / EV_REC, std::ptr::null());
+                    break;
+                }
+                let next = *((c as usize + LINK_OFF) as *const usize) as *mut u64;
+                f(c as *const u8, LINK_OFF / EV_REC, next as *const u8);
+                c = next;
+            }
+        }
+    }
+    #[inline(always)]
     pub fn for_each(&self, b: usize, mut f: impl FnMut(&[Rec])) {
         assert!(!R12);
         self.for_each_raw(b, |p, n| f(unsafe { std::slice::from_raw_parts(p as *const Rec, n) }));
