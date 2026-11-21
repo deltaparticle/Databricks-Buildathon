@@ -1,4 +1,4 @@
-// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 1fe68bc,
+// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 954c08d,
 // src/main.cpp), used under the organizers' open-reuse policy for this buildathon.
 // Fast path.
 //
@@ -531,17 +531,28 @@ struct NumMap {
     num = (u32)v;
     return num < LIMIT;
   }
-  void insert(const char* p, u32 n, u32 val) {  // p need not be padded
+  // Adds an ID of the shape: 1 when added, 2 when it was already there, 0
+  // when the ID is not one this table holds. p need not be padded.
+  int put(const char* p, u32 n, u32 val) {
     char b[24] = {0};
-    if (n > 16) return;
+    if (n > 16) return 0;
     memcpy(b, p, n);
     u32 num;
-    if (number(b, n, num) && !a[num]) a[num] = val + 1;
+    if (!number(b, n, num)) return 0;
+    if (a[num]) return 2;
+    a[num] = val + 1;
+    return 1;
   }
 };
 static ShortMap g_prod, g_camp;
 static NumMap g_prodn, g_campn;
-// Looks an ID up in both. p must be readable for 16 bytes.
+// An ID is in exactly one of the two: the NumMap when it has the shape, the
+// ShortMap otherwise. Adds it; false when it was already there.
+static bool add_id(NumMap& nm, ShortMap& sm, const char* p, u32 n, u32 val) {
+  const int r = nm.put(p, n, val);
+  return r ? r == 1 : sm.insert(p, n, val);
+}
+// Looks an ID up. p must be readable for 16 bytes.
 static AINLINE bool find_id(const NumMap& nm, const ShortMap& sm, const char* p, u32 n, u32& val) {
   u32 num;
   if (LIKELY(nm.number(p, n, num))) {
@@ -550,6 +561,13 @@ static AINLINE bool find_id(const NumMap& nm, const ShortMap& sm, const char* p,
     return v != 0;
   }
   return sm.find(p, n, val);
+}
+// The same for the generic parsers: any length, p need not be padded.
+static NOINLINE bool find_any(const NumMap& nm, const ShortMap& sm, const char* p, u32 n, u32& val) {
+  if (n > 16) return sm.find_long(p, n, val);
+  char b[24] = {0};
+  memcpy(b, p, n);
+  return find_id(nm, sm, b, n, val);
 }
 static vector<string> g_cat_names;  // sorted byte-wise; the index is the rank
 static u32 NCAT, UNKNOWN_CAT;
@@ -594,17 +612,26 @@ struct Blk {
   u32 used;
 };
 struct BlkArena {
+  static constexpr size_t CHUNK = 16u << 20;
   char* cur = nullptr;
   char* end = nullptr;
+  char* first = nullptr;  // the first chunk
   Blk* get() {
     if (cur == end) {
-      const size_t sz = 16u << 20;
-      cur = (char*)big_alloc(sz);
-      end = cur + sz;
+      cur = (char*)big_alloc(CHUNK);
+      end = cur + CHUNK;
+      if (!first) first = cur;
     }
     Blk* b = (Blk*)cur;
     cur += BLK;
     return b;
+  }
+  // n bytes of the first chunk that blocks have used, so are paged in; null
+  // when there are not that many. For the end of the run, when no block is live.
+  char* paged_in(size_t n) const {
+    if (!first) return nullptr;
+    const size_t have = end == first + CHUNK ? (size_t)(cur - first) : CHUNK;
+    return have >= n ? first : nullptr;
   }
 };
 static AINLINE void nt_copy(char* dst, const char* src, size_t n) {
@@ -734,6 +761,7 @@ struct Arr {
 struct Buf {
   char* p = nullptr;
   size_t n = 0, cap = 0;
+  bool lent = false;  // p is memory someone else owns
   AINLINE void need(size_t k) {
     if (UNLIKELY(n + k > cap)) grow(k);
   }
@@ -741,8 +769,8 @@ struct Buf {
     size_t nc;
     char* q = (char*)buf_alloc(std::max<size_t>(cap * 2, std::max<size_t>(n + k, 4u << 20)), nc);
     if (p) memcpy(q, p, n);
-    buf_free(p, cap);
-    p = q, cap = nc;
+    if (!lent) buf_free(p, cap);
+    p = q, cap = nc, lent = false;
   }
   template <class T>
   AINLINE void put(T v) {
@@ -1096,14 +1124,8 @@ static NOINLINE void slow_event(TC& tc, const char* s, const char* e) {
     r.uid = id_key(fp[1], fl[1], 'u');
     r.ts = (u32)(ts - WS);
     if (type == 2) {
-      char pb[16] = {0};
       u32 cat = UNKNOWN_CAT;
-      if (fl[5] <= 8) {
-        memcpy(pb, fp[5], fl[5]);
-        g_prod.find(pb, fl[5], cat);
-      } else {
-        g_prod.find_long(fp[5], fl[5], cat);
-      }
+      find_any(g_prodn, g_prod, fp[5], fl[5], cat);
       r.pc = price << 8 | cat;
     }
   }
@@ -1249,13 +1271,7 @@ static NOINLINE void slow_click(TC& tc, const char* s, const char* e) {
   i64 ts;
   if (!parse_ts(fp[3], fl[3], ts) || ts < WS - 7 * DAYMS || ts >= WE) return;
   u32 camp;
-  char cb[16] = {0};
-  if (fl[2] <= 8) {
-    memcpy(cb, fp[2], fl[2]);
-    if (!g_camp.find(cb, fl[2], camp)) return;
-  } else if (!g_camp.find_long(fp[2], fl[2], camp)) {
-    return;
-  }
+  if (!find_any(g_campn, g_camp, fp[2], fl[2], camp)) return;
   emit_click(tc, id_key(fp[0], fl[0], 'k'), id_key(fp[1], fl[1], 'u'), (u32)(ts - (WS - 7 * DAYMS)), camp);
 }
 // Returns 1 when out holds a valid click, 0 when the click is dropped, -1 for the generic parser.
@@ -2368,13 +2384,24 @@ static string env(const char* k, const char* d) {
   return v && *v ? string(v) : string(d);
 }
 static string read_all(const string& path) {
-  FILE* f = fopen(path.c_str(), "rb");
-  if (!f) return "";
   string s;
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) return s;
+  struct stat st;
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {  // the usual case: one read of the whole file
+    s.resize((size_t)st.st_size);
+    size_t got = 0;
+    while (got < s.size()) {
+      ssize_t r = read(fd, &s[got], s.size() - got);
+      if (r <= 0) break;
+      got += (size_t)r;
+    }
+    s.resize(got);
+  }
   char buf[65536];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
-  fclose(f);
+  ssize_t r;
+  while ((r = read(fd, buf, sizeof buf)) > 0) s.append(buf, (size_t)r);
+  close(fd);
   return s;
 }
 static bool manifest_ts(const string& js, const char* key, i64& v) {
@@ -2443,10 +2470,33 @@ int main(int argc, char** argv) {
   while ((1u << g_bbits) < g_nbkt) g_bbits++;
   init_dates();
 
+  // ---- inputs: listed and mapped on another thread while the lookups load
+  vector<string> in_names[3];
+  vector<MFile> in_maps[3];
+  std::thread mapper([&] {
+    const char* dirs[3] = {"/events", "/clicks", "/links"};
+    for (int k = 0; k < 3; k++) in_names[k] = list_csv(data + dirs[k]), in_maps[k].resize(in_names[k].size());
+    std::atomic<size_t> next{0};
+    const size_t total = in_names[0].size() + in_names[1].size() + in_names[2].size();
+    parallel(std::min<int>(NT, (int)total / 8 + 1), [&](int) {
+      for (;;) {
+        size_t i = next.fetch_add(1);
+        if (i >= total) break;
+        int k = i < in_names[0].size() ? 0 : (i < in_names[0].size() + in_names[1].size() ? 1 : 2);
+        size_t j = i - (k == 0 ? 0 : (k == 1 ? in_names[0].size() : in_names[0].size() + in_names[1].size()));
+        in_maps[k][j] = map_file(in_names[k][j]);
+      }
+    });
+  });
+
   // ---- products and campaigns
   {
     string s = read_all(data + "/products.csv");
     std::unordered_map<std::string_view, u32> cats;
+    struct {  // the category of the last product that hashed here: most lookups end at it
+      const char* p = nullptr;
+      u32 n = 0, ci = 0;
+    } recent[64];
     vector<string> names;
     struct P {
       const char* p;
@@ -2458,18 +2508,23 @@ int main(int argc, char** argv) {
       u32 fl[2];
       if (!split(a, b, 2, fp, fl)) return;
       std::string_view cn(fp[1], fl[1]);  // points into s, which outlives the map
-      auto it = cats.find(cn);
+      auto& rc = recent[(fl[1] * 7 + (fl[1] ? (u8)fp[1][0] + (u8)fp[1][fl[1] - 1] * 5 : 0)) & 63];
       u32 ci;
-      if (it == cats.end()) {
-        ci = (u32)names.size();
-        cats.emplace(cn, ci);
-        names.emplace_back(cn);
+      if (rc.p && rc.n == fl[1] && memcmp(rc.p, fp[1], fl[1]) == 0) {
+        ci = rc.ci;
       } else {
-        ci = it->second;
+        auto it = cats.find(cn);
+        if (it == cats.end()) {
+          ci = (u32)names.size();
+          cats.emplace(cn, ci);
+          names.emplace_back(cn);
+        } else {
+          ci = it->second;
+        }
+        rc.p = fp[1], rc.n = fl[1], rc.ci = ci;
       }
       prods.push_back({fp[0], fl[0], ci});
     });
-    prods.reserve(1024);
     if (!cats.count(std::string_view("unknown"))) names.push_back("unknown");
     NCAT = (u32)names.size();
     if (NCAT > 255) return fallback();
@@ -2481,8 +2536,7 @@ int main(int argc, char** argv) {
     UNKNOWN_CAT = (u32)(std::find(g_cat_names.begin(), g_cat_names.end(), "unknown") - g_cat_names.begin());
     g_prod.init(prods.size());
     g_prodn.init("p");
-    for (auto& p : prods)
-      if (g_prod.insert(p.p, p.n, rank[p.cat])) g_prodn.insert(p.p, p.n, rank[p.cat]);
+    for (auto& p : prods) add_id(g_prodn, g_prod, p.p, p.n, rank[p.cat]);  // the first of repeated IDs counts
   }
   {
     string s = read_all(data + "/campaigns.csv");
@@ -2493,10 +2547,7 @@ int main(int argc, char** argv) {
       const char* fp[2];
       u32 fl[2];
       if (!split(a, b, 2, fp, fl)) return;
-      if (g_camp.insert(fp[0], fl[0], (u32)g_camp_id.size())) {
-        g_campn.insert(fp[0], fl[0], (u32)g_camp_id.size());
-        g_camp_id.emplace_back(fp[0], fl[0]), g_camp_chan.emplace_back(fp[1], fl[1]);
-      }
+      if (add_id(g_campn, g_camp, fp[0], fl[0], (u32)g_camp_id.size())) g_camp_id.emplace_back(fp[0], fl[0]), g_camp_chan.emplace_back(fp[1], fl[1]);
     });
     NCAMP = (u32)g_camp_id.size();
     ORGANIC = NCAMP;
@@ -2510,20 +2561,8 @@ int main(int argc, char** argv) {
   size_t ev_bytes = 0, ck_bytes = 0;
   const size_t CHUNK = (size_t)atoi(env("CHUNK_KB", "1024").c_str()) << 10;
   {
-    vector<string> names[3] = {list_csv(data + "/events"), list_csv(data + "/clicks"), list_csv(data + "/links")};
-    vector<MFile> maps[3];
-    for (int k = 0; k < 3; k++) maps[k].resize(names[k].size());
-    std::atomic<size_t> next{0};
-    size_t total = names[0].size() + names[1].size() + names[2].size();
-    parallel(std::min<int>(NT, (int)total / 8 + 1), [&](int) {
-      for (;;) {
-        size_t i = next.fetch_add(1);
-        if (i >= total) break;
-        int k = i < names[0].size() ? 0 : (i < names[0].size() + names[1].size() ? 1 : 2);
-        size_t j = i - (k == 0 ? 0 : (k == 1 ? names[0].size() : names[0].size() + names[1].size()));
-        maps[k][j] = map_file(names[k][j]);
-      }
-    });
+    mapper.join();
+    vector<MFile>* const maps = in_maps;
     for (auto& f : maps[0])
       if (f.p) {
         for (size_t s = 0; s < f.n; s += CHUNK) ev_tasks.push_back({(u32)ev_files.size(), s, std::min(f.n, s + CHUNK)});
@@ -2732,17 +2771,56 @@ int main(int argc, char** argv) {
 
   // ---- campaign_daily
   {
+    struct Tot {
+      i64 s, as, pu, rv;
+    };
+    // The table of totals and the seven columns have known upper bounds. No
+    // block is live any more, so they go in arena memory that is already
+    // paged in rather than in fresh pages the kernel would have to zero.
+    size_t idmax = 7, chmax = 7;  // "organic"
+    for (auto& x : g_camp_id) idmax = std::max(idmax, x.size());
+    for (auto& x : g_camp_chan) chmax = std::max(chmax, x.size());
+    const size_t colcap[7] = {NAGG * (idmax + 4), NAGG * (chmax + 4), NAGG * 4, NAGG * 8, NAGG * 8, NAGG * 8, NAGG * 8};
+    size_t want = NAGG * sizeof(Tot);
+    for (size_t c : colcap) want += (c + 15) & ~(size_t)15;
+    char* const warm = g_tc[0]->arena.paged_in(want);
+    vector<Tot> tot_heap(warm ? 0 : NAGG);
+    Tot* const tot = warm ? (Tot*)warm : tot_heap.data();
+    {
+      std::atomic<size_t> next{0};
+      const size_t STEP = 4096;
+      parallel(NT, [&](int) {
+        for (;;) {
+          const size_t lo = next.fetch_add(STEP, std::memory_order_relaxed);
+          if (lo >= NAGG) break;
+          const size_t hi = std::min(NAGG, lo + STEP);
+          for (size_t at = lo; at < hi; at++) {
+            i64 s = 0, pu = 0, rv = 0, as = 0;
+            for (auto* tc : g_tc)
+              s += tc->agg[at].sess + tc->agg8[at].sess, pu += tc->a_purch[at], rv += tc->a_rev[at], as += tc->agg[at].asst + tc->agg8[at].asst;
+            tot[at] = Tot{s, as, pu, rv};
+          }
+        }
+      });
+    }
     Buf cid, chan, day, ses, pur, rev, ast;
+    if (warm) {
+      char* w = warm + NAGG * sizeof(Tot);
+      int k = 0;
+      for (Buf* b : {&cid, &chan, &day, &ses, &pur, &rev, &ast}) {
+        b->p = w, b->cap = colcap[k], b->lent = true;
+        w += (colcap[k++] + 15) & ~(size_t)15;
+      }
+    }
     i64 n = 0;
-    for (u32 c = 0; c <= NCAMP; c++)
+    const string organic = "organic";
+    for (u32 c = 0; c <= NCAMP; c++) {
+      const string& id = c == ORGANIC ? organic : g_camp_id[c];
+      const string& ch = c == ORGANIC ? organic : g_camp_chan[c];
       for (int d = 0; d < ND; d++) {
-        size_t at = (size_t)c * (size_t)ND + d;
-        i64 s = 0, pu = 0, rv = 0, as = 0;
-        for (auto* tc : g_tc)
-          s += tc->agg[at].sess + tc->agg8[at].sess, pu += tc->a_purch[at], rv += tc->a_rev[at], as += tc->agg[at].asst + tc->agg8[at].asst;
+        const Tot& t = tot[(size_t)c * (size_t)ND + d];
+        const i64 s = t.s, pu = t.pu, rv = t.rv, as = t.as;
         if (!s && !as) continue;
-        const string& id = c == ORGANIC ? string("organic") : g_camp_id[c];
-        const string& ch = c == ORGANIC ? string("organic") : g_camp_chan[c];
         cid.need(id.size() + 4), chan.need(ch.size() + 4);
         cid.put<u32>((u32)id.size());
         memcpy(cid.p + cid.n, id.data(), id.size()), cid.n += id.size();
@@ -2753,6 +2831,7 @@ int main(int argc, char** argv) {
         ses.put<i64>(s), pur.put<i64>(pu), rev.put<i64>(rv), ast.put<i64>(as);
         n++;
       }
+    }
     vector<PqCol> cols;
     cols.push_back({"campaign_id", P_BYTES, 0, 1, false, cid.p, cid.n, ""});
     cols.push_back({"channel", P_BYTES, 0, 1, false, chan.p, chan.n, ""});

@@ -1,4 +1,4 @@
-// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 1fe68bc,
+// Adapted from https://github.com/Dremix10/shopping-sessions-fast (commit 954c08d,
 // src/fallback.cpp), used under the organizers' open-reuse policy for this buildathon.
 // Generic (slow, fully general) pipeline. Used only when the fast path in
 // main.cpp meets an input it cannot represent exactly.
