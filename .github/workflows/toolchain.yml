@@ -1,0 +1,128 @@
+name: toolchain
+
+# Toolchain experiments on the shipped pipeline (lane/), official 20M data:
+# BOLT post-link layout (perf profile from another seed), libc choice
+# (musl static as shipped vs glibc static/dynamic), LLVM vector width,
+# nightly rustc (newer LLVM). Every variant gets an exact-output check vs the
+# shipped musl build, then an interleaved timing sweep on the same machine.
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Rounds per sweep"
+        required: false
+        default: "15"
+      reps:
+        description: "JSON list; one job per entry (different runners)"
+        required: false
+        default: '["r1", "r2", "r3"]'
+      thp:
+        description: "THP mode to set (always = grader)"
+        required: false
+        default: "always"
+
+permissions:
+  contents: read
+
+jobs:
+  tc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: ${{ fromJSON(github.event.inputs.reps) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          nproc; lscpu | grep -E "Model name|L1i|L2|L3"
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
+            grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
+          done
+          echo ${{ github.event.inputs.thp }} | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+          uname -r; rustc --version
+      - name: Tools
+        run: |
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
+          # BOLT: newest from apt.llvm.org, else the distro's
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20 >/dev/null 2>&1 && sudo apt-get install -y -qq bolt-20 >/dev/null 2>&1 || sudo apt-get install -y -qq bolt-18 >/dev/null 2>&1 || true
+          ls /usr/bin/llvm-bolt* /usr/bin/perf2bolt* /usr/lib/llvm-*/bin/llvm-bolt 2>/dev/null || true
+          rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1
+          rustup toolchain install nightly --profile minimal --target x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+          pip install --quiet polars
+      - name: Data
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          G=tools/generator/target/release/generate
+          $G --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          $G --seed 7 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/t20" 2>&1 | tail -1
+      - name: Build
+        run: |
+          FL="-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5"
+          M=x86_64-unknown-linux-musl
+          b() {  # label, target, extra rustflags, [toolchain]
+            l=$1; t=$2; x=$3; tc=${4:-}
+            (cd lane && RUSTFLAGS="$FL $x" CARGO_TARGET_DIR=/tmp/t-$l cargo $tc build --release -q --target $t 2>&1 | grep -v "^$" | tail -3) && cp /tmp/t-$l/$t/release/pipeline ./bin-$l && ls -l bin-$l || echo "build $l failed"
+          }
+          # shipped recipe (config.toml rustflags, musl, as in the Dockerfile)
+          (cd lane && CARGO_TARGET_DIR=/tmp/t-base cargo build --release -q --target $M) && cp /tmp/t-base/$M/release/pipeline ./bin-base
+          b base2 $M ""
+          cmp bin-base bin-base2 && echo "RUSTFLAGS build == config build"
+          b relocs $M "-C link-arg=-Wl,--emit-relocs"
+          b gstatic x86_64-unknown-linux-gnu "-C target-feature=+crt-static"
+          b gdyn x86_64-unknown-linux-gnu ""
+          b p512 $M "-C target-feature=-prefer-256-bit"
+          b nightly $M "" +nightly
+          (cd lane && RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static" CARGO_TARGET_DIR=/tmp/t-nojcc cargo build --release -q --target $M) && cp /tmp/t-nojcc/$M/release/pipeline ./bin-nojcc
+          rustc +nightly --version || true
+          ls -l bin-*
+      - name: Frontend counters (is layout a bottleneck at all?)
+        run: |
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}; echo "PERF=$PERF" >> $GITHUB_ENV
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          $PERF stat -e task-clock,cycles:u,instructions:u,branch-misses:u,L1-icache-load-misses:u,iTLB-load-misses:u env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./bin-base 2>&1 | tail -14 || true
+          $PERF stat -e cycles:u,frontend_retired.l1i_miss:u,icache_64b.iftag_stall:u,idq_uops_not_delivered.core:u,dsb2mite_switches.penalty_cycles:u env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./bin-base 2>&1 | tail -10 || true
+      - name: BOLT
+        run: |
+          BOLT=$(ls /usr/bin/llvm-bolt-20 /usr/lib/llvm-20/bin/llvm-bolt /usr/bin/llvm-bolt-18 /usr/lib/llvm-18/bin/llvm-bolt 2>/dev/null | head -1)
+          P2B=$(ls /usr/bin/perf2bolt-20 /usr/lib/llvm-20/bin/perf2bolt /usr/bin/perf2bolt-18 /usr/lib/llvm-18/bin/perf2bolt 2>/dev/null | head -1)
+          echo "BOLT=$BOLT P2B=$P2B"; [ -n "$BOLT" ] || exit 0
+          $BOLT --version | head -3
+          tr() { for i in 1 2 3 4 5 6 7 8; do DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./bin-relocs >/dev/null 2>&1; done; }
+          export -f tr; export RUNNER_TEMP
+          LBR=0
+          if $PERF record -e cycles:u -j any,u -o lbr.data -- bash -c tr 2>lbr.err; then LBR=1; else tail -2 lbr.err; fi
+          echo "LBR=$LBR"
+          if [ $LBR = 1 ]; then
+            $P2B -p lbr.data -o prof.fdata ./bin-relocs 2>&1 | tail -5
+          else
+            $PERF record -F 20000 -e cycles:u -o nl.data -- bash -c tr 2>&1 | tail -2
+            $P2B -nl -p nl.data -o prof.fdata ./bin-relocs 2>&1 | tail -5
+          fi
+          ls -l prof.fdata; head -3 prof.fdata
+          bo() {  # label, opts...
+            l=$1; shift
+            $BOLT ./bin-relocs -o ./bin-$l -data=prof.fdata "$@" 2>&1 | grep -E "BOLT-(INFO|WARNING|ERROR)" | grep -vE "^BOLT-INFO: (Section|  )" | tail -25 || true
+            [ -x ./bin-$l ] && echo "bolt $l ok" || echo "bolt $l FAILED"
+          }
+          bo bolt_a -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -dyno-stats -icf=1 -use-gnu-stack
+          bo bolt_b -reorder-blocks=ext-tsp -reorder-functions=cdsort -use-gnu-stack
+          bo bolt_c -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -use-gnu-stack -x86-align-branch-boundary-hot-only -x86-branches-within-32B-boundaries
+          bo bolt_d -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -icf=1 -use-gnu-stack -align-blocks -peepholes=all -plt=hot -frame-opt=hot -inline-small-functions
+          ls -l bin-*
+      - name: Exact checks vs shipped build (timing set, seed 42)
+        run: |
+          a=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) ./bin-base
+          echo "base ./bin-base" > v.txt
+          for f in bin-*; do l=${f#bin-}; [ $l = base ] && continue
+            o=$(mktemp -d)
+            if DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./$f; then
+              r=$(cd scripts && python3 compare.py "$a" "$o" | tail -1); echo "$l vs base: $r"
+              echo "$l ./$f" >> v.txt
+            else echo "$l: run FAILED"; fi
+          done
+          cat v.txt
+      - name: Sweep
+        run: python3 tools/sweep.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds }} v.txt
