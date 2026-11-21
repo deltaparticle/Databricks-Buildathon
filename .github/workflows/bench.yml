@@ -100,6 +100,32 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
+      - name: PGO A/B (profile-guided build vs normal build of this commit)
+        run: |
+          rustup component add llvm-tools >/dev/null 2>&1 || rustup component add llvm-tools-preview
+          PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1)
+          rm -rf /tmp/pgo && mkdir -p /tmp/pgo
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -Cprofile-generate=/tmp/pgo" CARGO_TARGET_DIR=/tmp/t-gen cargo build --release -q
+          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) /tmp/t-gen/release/shopping
+          $PROFDATA merge -o /tmp/pgo/merged.profdata /tmp/pgo/*.profraw
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -Cprofile-use=/tmp/pgo/merged.profdata" CARGO_TARGET_DIR=/tmp/t-pgo cargo build --release -q
+          A=/tmp/t-pgo/release/shopping; B=./target/release/shopping
+          rm -f pgo.txt
+          for i in 1 2 3 4 5 6; do
+            for which in A B; do
+              bin=$A; [ $which = B ] && bin=$B
+              /usr/bin/time -f "$which wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) $bin 2>> pgo.txt
+            done
+          done
+          python3 - <<'PY'
+          import statistics as st
+          rows = [l.split() for l in open("pgo.txt") if l.startswith(("A ", "B "))]
+          for w, name in (("A", "PGO"), ("B", "normal")):
+              walls = [float(r[1][5:]) for r in rows if r[0] == w]
+              users = [float(r[2][5:]) for r in rows if r[0] == w]
+              print(f"{name}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
+          PY
+
       - name: perf profile (line level)
         run: |
           sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
