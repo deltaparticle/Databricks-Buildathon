@@ -1641,8 +1641,7 @@ static bool recover_key(const vector<std::pair<u64, u64>>& pr, const vector<u64>
     const u64 mod = (u64)1 << (bit + 1), m = mod - 1;
     nx.clear();
     for (u64 k0 : cands)
-      const u64 two[2] = {k0, k0 | ((u64)1 << bit)};
-      for (u64 kb : two) {
+      for (u64 kb : {k0, (u64)(k0 | ((u64)1 << bit))}) {
         u32 ok = 0;
         if (mod <= 2 * S)
           ok = (u32)pr.size();
