@@ -17,3 +17,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pgo_gen)"] }

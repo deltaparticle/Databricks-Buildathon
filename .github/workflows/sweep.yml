@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [rt, ct1, ct2, pgo]
+        part: [rt2, ct1, pgo]
     steps:
       - uses: actions/checkout@v4
       - name: Machine
@@ -44,12 +44,19 @@ jobs:
           echo "base2 ./lanebin" >> v.txt
           build() {  # label, env assignments...
             label=$1; shift
-            (cd lane && env "$@" CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q) && cp /tmp/t-$label/release/pipeline ./bin-$label && echo "$label ./bin-$label" >> v.txt
+            (cd lane && env "$@" CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q) && cp /tmp/t-$label/release/pipeline ./bin-$label && echo "$label ./bin-$label" >> v.txt || echo "build $label failed"
           }
           case "${{ matrix.part }}" in
             rt) cp tools/sweep_rt.txt v.txt ;;
+            rt2) printf 'base ./lanebin
+base2 ./lanebin
+r3_0 ./lanebin XL_R3=0
+spin100 ./lanebin XL_SPIN=100
+pparts0 ./lanebin XL_PPARTS=0
+combo ./lanebin XL_R3=0 XL_SPIN=100 XL_PPARTS=0
+' > v.txt ;;
             ct1)
-              build bb14 XL_BB=14; build bb16 XL_BB=16; build ub11 XL_UB=11; build ub13 XL_UB=13
+              build bb14 XL_BB=14; build bb13 XL_BB=13; build ub11 XL_UB=11; build ub13 XL_UB=13
               build sub2048 XL_SUB_DEF=2048; build sub8192 XL_SUB_DEF=8192; build slab12 XL_SLABROWS=12; build slab14 XL_SLABROWS=14 ;;
             ct2)
               build cxr32 XL_CXRDIV=32; build cxr128 XL_CXRDIV=128; build heavy2 XL_HEAVY_DIV=2; build heavy8 XL_HEAVY_DIV=8
@@ -58,7 +65,7 @@ jobs:
               rustup component add llvm-tools >/dev/null 2>&1
               PD=$(find ~/.rustup -name llvm-profdata | head -1)
               FL="-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5"
-              (cd lane && RUSTFLAGS="$FL -Cprofile-generate=/tmp/pgo" CARGO_TARGET_DIR=/tmp/t-gen cargo build --release -q)
+              (cd lane && RUSTFLAGS="$FL --cfg pgo_gen -Cprofile-generate=/tmp/pgo" CARGO_TARGET_DIR=/tmp/t-gen cargo build --release -q)
               G=tools/generator/target/release/generate
               for s in 7 1234 99; do $G --seed $s --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/tr$s" >/dev/null 2>&1
                 DATA_DIR="$RUNNER_TEMP/tr$s" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) /tmp/t-gen/release/pipeline; rm -rf "$RUNNER_TEMP/tr$s"; done
