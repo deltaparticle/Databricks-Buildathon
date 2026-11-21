@@ -12,6 +12,9 @@ on:
         description: "Commit to A/B against (default: the previous commit)"
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -100,31 +103,39 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
-      - name: Parameter sweep (same binary, round-robin, same machine)
+      - name: Competitors on the same machine (public repos, read-only token)
         run: |
-          declare -A CFG=(
-            [default]=""
-            [P8]="SHOP_P_BITS=8" [P10]="SHOP_P_BITS=10"
-            [Q6]="SHOP_Q_BITS=6" [Q8]="SHOP_Q_BITS=8"
-            [C512K]="SHOP_CHUNK_KB=512" [C8M]="SHOP_CHUNK_KB=8192"
-            [THP]="MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
-            [F4]="SHOP_FILTER_BITS=4" [F16]="SHOP_FILTER_BITS=16"
-          )
-          rm -f sweep.txt
-          for i in 1 2 3; do
-            for name in "${!CFG[@]}"; do
-              /usr/bin/time -f "$name wall=%e user=%U" env ${CFG[$name]} DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./target/release/shopping 2>> sweep.txt
+          set +e
+          git clone -q --depth 1 https://github.com/shanmukha-here/eagle-eye-shopping-sessions /tmp/ee &&             (cd /tmp/ee && git log --oneline -1 && CARGO_TARGET_DIR=/tmp/ee-t cargo build --release -q) 
+          git clone -q --depth 1 https://github.com/Dremix10/shopping-sessions-fast /tmp/dx &&             (cd /tmp/dx && git log --oneline -1 && g++ -O3 -march=x86-64-v3 -std=c++20 -pthread -o /tmp/dx-bin src/main.cpp src/fallback.cpp)
+          EE=$(ls /tmp/ee-t/release/shopping-sessions 2>/dev/null); DX=/tmp/dx-bin; US=./target/release/shopping
+          rm -f comp.txt
+          for i in 1 2 3 4 5; do
+            for name in ours eagle dremix; do
+              case $name in ours) bin=$US;; eagle) bin=$EE;; dremix) bin=$DX;; esac
+              [ -x "$bin" ] || continue
+              out=$(mktemp -d)
+              /usr/bin/time -f "$name wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) "$bin" > /dev/null 2>> comp.txt
+              echo "$out" > "last_$name"
             done
           done
+          grep -E "^(ours|eagle|dremix) wall" comp.txt
           python3 - <<'PY'
-          import statistics as st, collections
+          import statistics as st, collections, glob, polars as pl
           d = collections.defaultdict(lambda: ([], []))
-          for l in open("sweep.txt"):
+          for l in open("comp.txt"):
               p = l.split()
-              if len(p) == 3 and p[1].startswith("wall="):
+              if len(p) == 4 and p[1].startswith("wall="):
                   d[p[0]][0].append(float(p[1][5:])); d[p[0]][1].append(float(p[2][5:]))
-          for k, (w, u) in sorted(d.items(), key=lambda kv: st.median(kv[1][0])):
-              print(f"{k:8s} median wall {st.median(w):.3f}s  user {st.median(u):.2f}s  n={len(w)}")
+          for k, (w, u) in d.items():
+              print(f"{k:7s} median wall {st.median(w):.3f}s  median user {st.median(u):.2f}s  n={len(w)}")
+          for name in d:
+              o = open(f"last_{name}").read().strip()
+              try:
+                  u = pl.concat([pl.read_parquet(f) for f in glob.glob(f"{o}/user_daily/*.parquet")])
+                  print(f"{name}: user_daily rows {u.height} sessions {u['sessions'].sum()} revenue {u['revenue_cents'].sum()}")
+              except Exception as e:
+                  print(name, "output unreadable:", e)
           PY
 
       - name: Cold page cache (drop caches before each run)

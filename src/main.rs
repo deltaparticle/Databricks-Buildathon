@@ -31,19 +31,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const GAP: i64 = 30 * 60 * 1000;
 const REACH: i64 = 7 * DAY;
-/// Default event_id and person partition counts (log2) and chunk size; the
-/// SHOP_P_BITS, SHOP_Q_BITS and SHOP_CHUNK_KB environment variables override
-/// them (for benchmarking).
 const P_BITS: u32 = 9;
 const P: usize = 1 << P_BITS;
 const Q_BITS: u32 = 7;
+const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
 const CLICK_SLICES: usize = 4;
 const CHUNK: usize = 2 << 20;
-
-fn env_num(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
 const PRICE_MASK: u64 = (1 << 24) - 1;
@@ -124,7 +118,6 @@ impl Lookup {
 }
 
 struct Ctx {
-    p_bits: u32,
     ws: i64,
     we: i64,
     cws: i64,
@@ -266,13 +259,13 @@ fn readahead_all(maps: &[&Mmap]) {
 }
 
 /// Newline-aligned byte ranges (file index, start, end) of every body.
-fn chunks(maps: &[Mmap], chunk: usize) -> Vec<(usize, usize, usize)> {
+fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     for (fi, m) in maps.iter().enumerate() {
         let len = m.len();
         let mut pos = len - body(m).len();
         while pos < len {
-            let mut end = (pos + chunk).min(len);
+            let mut end = (pos + CHUNK).min(len);
             if end < len {
                 end = match memchr::memchr(b'\n', &m[end..]) {
                     Some(i) => end + i + 1,
@@ -349,7 +342,6 @@ fn load_ctx(data: &Path) -> Ctx {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     Ctx {
-        p_bits: env_num("SHOP_P_BITS", P_BITS as usize) as u32,
         ws,
         we,
         cws: ws - REACH,
@@ -426,7 +418,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>], tsc: &mut ts:
             ev.cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
         }
     }
-    buckets[part(mix(ekey), ctx.p_bits)].push(ev);
+    buckets[part(mix(ekey), P_BITS)].push(ev);
 }
 
 #[inline(always)]
@@ -445,54 +437,61 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>, tsc: &mut ts::DateC
 /// Every linked ID that is not its person's name -> the name. A bitmap in
 /// front of the table answers most lookups (IDs that are names) from cache.
 struct Aliases {
-    /// (alias ID, person name) slots, one cache miss per probe.
-    slots: Vec<(u64, u64)>,
+    keys: Vec<u64>,
+    vals: Vec<u64>,
     mask: usize,
-    /// Word-blocked filter: two bits in one 64-bit word per alias.
     filter: Vec<u64>,
-    wmask: usize,
+    fmask: u64,
 }
 
 impl Aliases {
     fn from_pairs(pairs: &[(u64, u64)]) -> Self {
         let cap = (pairs.len() * 2).next_power_of_two().max(16);
-        let bits_per_key = env_num("SHOP_FILTER_BITS", 8).max(1);
-        let words = (pairs.len() * bits_per_key / 64 + 1).next_power_of_two().max(64);
-        let mut m = Aliases { slots: vec![(EMPTY, 0); cap], mask: cap - 1, filter: vec![0; words], wmask: words - 1 };
+        let fbits = (pairs.len() * 16).next_power_of_two().max(1 << 12);
+        let mut m = Aliases {
+            keys: vec![EMPTY; cap],
+            vals: vec![0; cap],
+            mask: cap - 1,
+            filter: vec![0; fbits / 64],
+            fmask: fbits as u64 - 1,
+        };
         for &(k, v) in pairs {
             let h = mix(k);
-            let (w, b) = Self::fbits(h, m.wmask);
-            m.filter[w] |= b;
+            let f = h & m.fmask;
+            m.filter[(f >> 6) as usize] |= 1 << (f & 63);
             let mut s = h as usize & m.mask;
-            while m.slots[s].0 != EMPTY && m.slots[s].0 != k {
+            while m.keys[s] != EMPTY && m.keys[s] != k {
                 s = (s + 1) & m.mask;
             }
-            m.slots[s] = (k, v);
+            m.keys[s] = k;
+            m.vals[s] = v;
         }
         m
-    }
-    #[inline(always)]
-    fn fbits(h: u64, wmask: usize) -> (usize, u64) {
-        ((h >> 20) as usize & wmask, (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63)))
     }
     /// `h` is mix(k).
     #[inline(always)]
     fn person(&self, k: u64, h: u64) -> u64 {
-        let (w, b) = Self::fbits(h, self.wmask);
-        if self.filter[w] & b != b {
+        let f = h & self.fmask;
+        if self.filter[(f >> 6) as usize] & (1 << (f & 63)) == 0 {
             return k;
         }
         let mut s = h as usize & self.mask;
         loop {
-            let (x, v) = self.slots[s];
+            let x = self.keys[s];
             if x == k {
-                return v;
+                return self.vals[s];
             }
             if x == EMPTY {
                 return k;
             }
             s = (s + 1) & self.mask;
         }
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        let f = h & self.fmask;
+        prefetch(self.filter.as_ptr().wrapping_add((f >> 6) as usize));
+        prefetch(self.keys.as_ptr().wrapping_add(h as usize & self.mask));
     }
 }
 
@@ -951,6 +950,9 @@ fn bench_alias(ctx: &Ctx, data: &Path) {
         let t = Instant::now();
         let mut y = 0u64;
         for i in 0..n {
+            if i + 16 < n {
+                a.prefetch(mix(ukeys[i + 16]));
+            }
             let u = ukeys[i];
             y ^= a.person(u, mix(u));
         }
@@ -1009,11 +1011,6 @@ fn main() {
         .unwrap_or_else(|| thread::available_parallelism().map_or(8, usize::from));
 
     let ctx = load_ctx(&data);
-    let p_bits = ctx.p_bits;
-    let q_bits = env_num("SHOP_Q_BITS", Q_BITS as usize) as u32;
-    let pn = 1usize << p_bits;
-    let qn = 1usize << q_bits;
-    let chunk = env_num("SHOP_CHUNK_KB", CHUNK >> 10) << 10;
     if std::env::var_os("SHOP_BENCH_ALIAS").is_some() {
         bench_alias(&ctx, &data);
         return;
@@ -1025,8 +1022,8 @@ fn main() {
     let event_files = map_files(&list_csv(&data.join("events")));
     let click_files = map_files(&list_csv(&data.join("clicks")));
     let link_paths = list_csv(&data.join("links"));
-    let event_chunks = chunks(&event_files, chunk);
-    let click_chunks = chunks(&click_files, chunk);
+    let event_chunks = chunks(&event_files);
+    let click_chunks = chunks(&click_files);
     let n_event_chunks = event_chunks.len();
     let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
     let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
@@ -1042,14 +1039,14 @@ fn main() {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
             scope.spawn(move || readahead_all(&all));
         }
-        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.slots.iter().filter(|x| x.0 != EMPTY).count()); } a });
+        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.keys.iter().filter(|&&k| k != EMPTY).count()); } a });
         let p1 = pool(
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
                 tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
-                ev: (0..pn).map(|_| Vec::with_capacity(est_events / threads / pn * 5 / 4)).collect(),
+                ev: (0..P).map(|_| Vec::with_capacity(est_events / threads / P * 5 / 4)).collect(),
                 cl: Vec::with_capacity(est_clicks / threads * 5 / 4),
             },
             |st, t| {
@@ -1080,10 +1077,10 @@ fn main() {
     let nw = p1.len();
     let p2 = pool(
         threads,
-        CLICK_SLICES * nw + pn,
+        CLICK_SLICES * nw + P,
         || P2 {
-            pe: (0..qn).map(|_| Vec::with_capacity(est_events / threads / qn * 5 / 4)).collect(),
-            pc: (0..qn).map(|_| Vec::with_capacity(est_clicks / threads / qn * 5 / 4)).collect(),
+            pe: (0..Q).map(|_| Vec::with_capacity(est_events / threads / Q * 5 / 4)).collect(),
+            pc: (0..Q).map(|_| Vec::with_capacity(est_clicks / threads / Q * 5 / 4)).collect(),
             seen: Vec::new(),
             coll: Vec::new(),
             dups: SmallIndex::new(1024),
@@ -1098,7 +1095,7 @@ fn main() {
                 let cl = &all[all.len() * k / CLICK_SLICES..all.len() * (k + 1) / CLICK_SLICES];
                 for &c in cl {
                     let person = aliases.person(c.ukey, mix(c.ukey));
-                    st.pc[part(mix(person), q_bits)].push(PCl { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
+                    st.pc[part(mix(person), Q_BITS)].push(PCl { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                 }
                 return;
             }
@@ -1133,7 +1130,7 @@ fn main() {
                 }
                 let h = mix(e.ukey);
                 let person = aliases.person(e.ukey, h);
-                st_pe[part(if person == e.ukey { h } else { mix(person) }, q_bits)].push(PEv {
+                st_pe[part(if person == e.ukey { h } else { mix(person) }, Q_BITS)].push(PEv {
                     person,
                     w: (e.ts as u64) << 32 | price << 8 | e.cat as u64,
                 });
@@ -1186,11 +1183,11 @@ fn main() {
     let wrote_user = std::sync::atomic::AtomicBool::new(false);
     let ncamp = ctx.camp_ids.len();
     // Largest person partitions first, so no thread is left with a big tail.
-    let mut order: Vec<usize> = (0..qn).collect();
+    let mut order: Vec<usize> = (0..Q).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(p2.iter().map(|w| w.pe[q].len() + w.pc[q].len()).sum::<usize>()));
     let p3 = pool_finish(
         threads,
-        qn,
+        Q,
         || P3 {
             index: SmallIndex::new(1024),
             persons: Vec::new(),
