@@ -48,13 +48,7 @@ jobs:
           }
           case "${{ matrix.part }}" in
             rt) cp tools/sweep_rt.txt v.txt ;;
-            rt2) printf 'base ./lanebin
-base2 ./lanebin
-r3_0 ./lanebin XL_R3=0
-spin100 ./lanebin XL_SPIN=100
-pparts0 ./lanebin XL_PPARTS=0
-combo ./lanebin XL_R3=0 XL_SPIN=100 XL_PPARTS=0
-' > v.txt ;;
+            rt2) cp tools/sweep_rt2.txt v.txt ;;
             ct1)
               build bb14 XL_BB=14; build bb13 XL_BB=13; build ub11 XL_UB=11; build ub13 XL_UB=13
               build sub2048 XL_SUB_DEF=2048; build sub8192 XL_SUB_DEF=8192; build slab12 XL_SLABROWS=12; build slab14 XL_SLABROWS=14 ;;
