@@ -71,9 +71,16 @@ jobs:
             DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$o" NCPU=$(nproc) ./origbin
             echo "$d vs reference: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
             echo "$d vs unmodified: $(cd scripts && python3 compare.py "$a" "$o" | tail -1)"
-            # byte-level: same files, same contents
-            (cd "$a" && find . -type f | sort | xargs sha256sum) > a.sum; (cd "$o" && find . -type f | sort | xargs sha256sum) > o.sum
-            cmp -s a.sum o.sum && echo "$d parquet files byte-identical to unmodified" || { echo "$d parquet bytes differ from unmodified"; diff a.sum o.sum | head; }
+            # byte level. With all threads, rows land in part files by which worker
+            # finishes first, so first check whether the unmodified build even
+            # repeats itself; then compare both builds single-threaded.
+            sums() { (cd "$1" && find . -type f | sort | xargs sha256sum); }
+            o2=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$o2" NCPU=$(nproc) ./origbin
+            cmp -s <(sums "$o") <(sums "$o2") && echo "$d unmodified vs itself, $(nproc) threads: byte-identical" || echo "$d unmodified vs itself, $(nproc) threads: bytes differ (thread timing)"
+            a1=$(mktemp -d); o1=$(mktemp -d)
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a1" NCPU=1 ./lanebin
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$o1" NCPU=1 ./origbin
+            cmp -s <(sums "$a1") <(sums "$o1") && echo "$d ours vs unmodified, 1 thread: byte-identical ($(ls "$a1"/user_daily | wc -l) user files)" || { echo "$d ours vs unmodified, 1 thread: bytes differ"; diff <(sums "$a1") <(sums "$o1") | head -6; }
           done
 
       - name: Container A/B, scorer flags (alternating, same machine)
