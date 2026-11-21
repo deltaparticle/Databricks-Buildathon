@@ -77,3 +77,17 @@ jobs:
             /usr/bin/time -f "wall=%es user=%Us sys=%Ss maxrss=%MKB" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) SHOP_PROFILE=1 \
               ./target/release/shopping 2>&1 | grep -E "wall=|cpu|s (parse|dedup|sessions|write)$" | tr '\n' ' '; echo
           done
+
+      - name: perf profile (line level)
+        run: |
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
+          echo "perf: $PERF"; sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" cargo build --release
+          out=$(mktemp -d)
+          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) $PERF record -F 4999 -o perf.data ./target/release/shopping 2>/dev/null
+          $PERF stat -e task-clock,cycles,instructions,cache-misses,branch-misses,page-faults env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./target/release/shopping 2>&1 | tail -14
+          echo "===== top symbols"
+          $PERF report -i perf.data --no-children --sort sym --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -30
+          echo "===== top source lines"
+          $PERF report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -80

@@ -923,6 +923,50 @@ fn bench_parse(ctx: &Ctx, path: &str) {
     }
 }
 
+/// Alias-lookup benchmark on real user IDs (single thread, in memory).
+fn bench_alias(ctx: &Ctx, data: &Path) {
+    let a = build_aliases(&list_csv(&data.join("links")));
+    let maps = map_files(&list_csv(&data.join("events")));
+    let mut ukeys: Vec<u64> = Vec::new();
+    for m in maps.iter().take(8) {
+        csv::scan::<7>(body(m), |f| {
+            if !f[1].is_empty() {
+                ukeys.push(keys::key(f[1]));
+            }
+        });
+    }
+    let _ = ctx;
+    let n = ukeys.len();
+    for round in 0..3 {
+        let t = Instant::now();
+        let mut x = 0u64;
+        for &u in &ukeys {
+            x ^= a.person(u, mix(u));
+        }
+        let plain = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut y = 0u64;
+        for i in 0..n {
+            if i + 16 < n {
+                a.prefetch(mix(ukeys[i + 16]));
+            }
+            let u = ukeys[i];
+            y ^= a.person(u, mix(u));
+        }
+        let pf = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut z = 0u64;
+        for &u in &ukeys {
+            z ^= mix(u);
+        }
+        let base = t.elapsed().as_secs_f64();
+        eprintln!(
+            "round {round}: {n} lookups  plain {:.1} ns  prefetch16 {:.1} ns  mix-only {:.1} ns [{}]",
+            plain * 1e9 / n as f64, pf * 1e9 / n as f64, base * 1e9 / n as f64, (x ^ y ^ z) & 1
+        );
+    }
+}
+
 struct Scatter0(Vec<Vec<Ev>>);
 impl Scatter0 {
     fn new() -> Self {
@@ -964,6 +1008,10 @@ fn main() {
         .unwrap_or_else(|| thread::available_parallelism().map_or(8, usize::from));
 
     let ctx = load_ctx(&data);
+    if std::env::var_os("SHOP_BENCH_ALIAS").is_some() {
+        bench_alias(&ctx, &data);
+        return;
+    }
     if let Ok(path) = std::env::var("SHOP_BENCH_PARSE") {
         bench_parse(&ctx, &path);
         return;
@@ -1041,12 +1089,7 @@ fn main() {
                 let all = &p1[t / CLICK_SLICES].cl;
                 let k = t % CLICK_SLICES;
                 let cl = &all[all.len() * k / CLICK_SLICES..all.len() * (k + 1) / CLICK_SLICES];
-                const AHEAD: usize = 8;
-                for i in 0..cl.len() {
-                    if i + AHEAD < cl.len() {
-                        aliases.prefetch(mix(cl[i + AHEAD].ukey));
-                    }
-                    let c = cl[i];
+                for &c in cl {
                     let person = aliases.person(c.ukey, mix(c.ukey));
                     st.pc[part(mix(person), Q_BITS)].push(PCl { person, ckey: c.ckey, ts: c.ts, camp: c.camp });
                 }
@@ -1091,11 +1134,7 @@ fn main() {
             let mut dup_refs: Vec<(u32, u32)> = Vec::new();
             for (wi, w) in p1.iter().enumerate() {
                 let evs = &w.ev[t];
-                const AHEAD: usize = 8;
                 for j in 0..evs.len() {
-                    if j + AHEAD < evs.len() {
-                        aliases.prefetch(mix(evs[j + AHEAD].ukey));
-                    }
                     let e = &evs[j];
                     let f = mix(e.ekey) & fmask;
                     if st.coll[(f >> 6) as usize] & (1u64 << (f & 63)) == 0 {
