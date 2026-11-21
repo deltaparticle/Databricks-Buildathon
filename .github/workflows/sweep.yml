@@ -19,6 +19,10 @@ on:
         description: "For refs_* parts: space-separated git refs to time against this commit"
         required: false
         default: ""
+      events:
+        description: "Events in the generated timing set (clicks = events / 4)"
+        required: false
+        default: "20000000"
 
 permissions:
   contents: read
@@ -44,7 +48,7 @@ jobs:
       - name: Data
         run: |
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
-          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          E=${{ github.event.inputs.events }}; tools/generator/target/release/generate --seed 42 --events $E --clicks $((E / 4)) --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
       - name: Build
         run: |
           cd lane
