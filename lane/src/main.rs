@@ -327,9 +327,6 @@ fn main() {
         HUGE.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     sys::detect_pages();
-    if std::env::var("XL_MEMDBG").is_ok_and(|v| v == "1") {
-        sys::MEMDBG.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
     unsafe { sys::LAST = Some(t0) };
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
@@ -493,10 +490,6 @@ fn main() {
     }
     if timing {
         eprintln!("[v2b] exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
-    }
-    if sys::MEMDBG.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[mem] ev_arena used {} MB of {} MB, us_arena used {} MB of {} MB", g.ev_arena.used() >> 20, g.ev_arena.span().1 >> 20, g.us_arena.used() >> 20, g.us_arena.span().1 >> 20);
-        sys::mem_report("end");
     }
     if std::env::var("XL_DBG").is_ok() {
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
