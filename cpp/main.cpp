@@ -708,7 +708,7 @@ struct Scatter {
       tail[p] = b;
       c = (char*)b + BLKH;
     }
-    if (n == WCB)
+    if (LIKELY(n == WCB && !((uintptr_t)c & 31)))  // a partial flush by finish() leaves c unaligned
       nt_copy(c, wc + (size_t)p * WCB, WCB);
     else
       memcpy(c, wc + (size_t)p * WCB, n);
