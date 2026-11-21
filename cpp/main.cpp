@@ -894,6 +894,7 @@ struct alignas(64) TC {
   };
   vector<Samp> esamp, csamp;
   u64 vmax = 0, wmax = 0;
+  double p2a = 0, p2b = 0;  // VERBOSE: ms in phase 2 passes
   Scatter<24, 8> cks2;
   vector<u64> dev;
   vector<Pu> dpu;
@@ -1791,6 +1792,7 @@ static void phase2_partition(TC& tc, u32 p) {
   const u64 mask = cap - 1;
   const int shift = 64 - g_p1bits - sb;
   const size_t nseg = tc.segs.size();
+  const double tp0 = VERBOSE ? now_ms() : 0;
   // Pass 1: find every event_id's copies; all but the one ingested first lose their ts.
   static_assert((BLK - BLKH) / sizeof(Ev) <= 256, "a record's index in its block fits a byte");
   if (LIKELY(nseg <= 255)) {
@@ -1866,6 +1868,8 @@ static void phase2_partition(TC& tc, u32 p) {
       }
     }
   }
+  const double tp1 = VERBOSE ? now_ms() : 0;
+  if (VERBOSE) tc.p2a += tp1 - tp0;
   // Pass 2: the survivors, by user ID. Who each ID belongs to is looked up
   // later, once per ID instead of once per event.
   const int sh2 = 64 - g_p2bits;
@@ -1898,6 +1902,7 @@ static void phase2_partition(TC& tc, u32 p) {
       fill[q] = (u8)f;
     }
   }
+  if (VERBOSE) tc.p2b += now_ms() - tp1;
   for (int t = 0; t < NT; t++) {  // hand the blocks to this thread's scatter
     Blk* b = g_tc[t]->evs.head[p];
     while (b) {
@@ -3017,6 +3022,12 @@ int main(int argc, char** argv) {
     });
   }
   tick("dedup");
+  if (VERBOSE) {
+    double a = 0, b = 0;
+    for (auto* tc : g_tc) a += tc->p2a, b += tc->p2b;
+    fprintf(stderr, "            phase 2 per thread: pass 1 %.1f ms, pass 2 %.1f ms
+", a / NT, b / NT);
+  }
   const size_t NAGG = (size_t)(NCAMP + 1) * ND;
   auto phase3_buffers = [&](TC& tc) {
     if (tc.wcnt) return;
@@ -3067,6 +3078,8 @@ int main(int argc, char** argv) {
         std::swap(tc->cks, tc->cks2);
       }
     }
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: clicks placed
+", now_ms());
     u64 vend = 0, wend = 0;
     for (auto* tc : g_tc) vend = std::max(vend, tc->vmax + 1), wend = std::max(wend, tc->wmax + 1);
     // Runs, range by range.
@@ -3087,8 +3100,12 @@ int main(int argc, char** argv) {
       });
     }
     vector<DRun> eruns, cruns;
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs
+", now_ms());
     join_runs(er, eruns, false), join_runs(crr, cruns, true);
     er.clear(), crr.clear();
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: runs joined
+", now_ms());
     // Count each person's runs; people with rows in the general partitions are flagged.
     g_ptcap = std::max<u64>(1024, (eruns.size() + cruns.size()) * 2);
     g_pt = (PSlot*)big_alloc(g_ptcap * sizeof(PSlot));
@@ -3130,6 +3147,8 @@ int main(int argc, char** argv) {
         (void)tc;
       });
     }
+    if (VERBOSE) fprintf(stderr, "[%8.1f ms] dense: people counted
+", now_ms());
     // Sessionize the simple people; send the others' rows to the general partitions.
     {
       std::atomic<size_t> next{0};
