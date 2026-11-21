@@ -186,11 +186,24 @@ fn pool<S: Send>(
     init: impl Fn() -> S + Sync,
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
+    pool_finish(threads, tasks, init, work, |_, _| {})
+}
+
+/// Like `pool`, and each thread runs `finish(state, thread_index)` as soon as
+/// no tasks are left for it (while other threads may still be working).
+fn pool_finish<S: Send>(
+    threads: usize,
+    tasks: usize,
+    init: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, usize) + Sync,
+    finish: impl Fn(&mut S, usize) + Sync,
+) -> Vec<S> {
     let next = AtomicUsize::new(0);
     thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
+            .map(|i| {
+                let (next, init, work, finish) = (&next, &init, &work, &finish);
+                scope.spawn(move || {
                     let mut state = init();
                     loop {
                         let t = next.fetch_add(1, AtomicOrdering::Relaxed);
@@ -199,6 +212,7 @@ fn pool<S: Send>(
                         }
                         work(&mut state, t);
                     }
+                    finish(&mut state, i);
                     state
                 })
             })
@@ -685,6 +699,7 @@ impl SmallIndex {
 }
 
 struct P1 {
+    prof: [f64; 2],
     ev: Vec<Vec<Ev>>,
     cl: Vec<Cl>,
 }
@@ -704,8 +719,8 @@ struct UserRows {
     names: Vec<u8>,
     name_ends: Vec<u32>,
     days: Vec<i32>,
-    sessions: Vec<i64>,
-    events: Vec<i64>,
+    sessions: Vec<i32>,
+    events: Vec<i32>,
     revenue: Vec<i64>,
     top: Vec<u8>,
     top_ends: Vec<u32>,
@@ -760,8 +775,8 @@ impl P3 {
         keys::bytes(person, &mut r.names);
         r.name_ends.push(r.names.len() as u32);
         r.days.push(day as i32);
-        r.sessions.push(s);
-        r.events.push(e);
+        r.sessions.push(s as i32);
+        r.events.push(e as i32);
         r.revenue.push(rev);
         if self.touched.is_empty() {
             r.top_defs.push(0);
@@ -915,6 +930,22 @@ impl Scatter0 {
     }
 }
 
+fn write_user(path: &Path, r: UserRows) {
+    out::write(
+        path,
+        out::USER_SCHEMA,
+        vec![
+            out::Col::Str(r.names, r.name_ends),
+            out::Col::I32(r.days),
+            out::Col::I32(r.sessions),
+            out::Col::I32(r.events),
+            out::Col::I64(r.revenue),
+            out::Col::OptStr(r.top, r.top_ends, r.top_defs),
+        ],
+    )
+    .expect("write user_daily");
+}
+
 fn main() {
     let t0 = Instant::now();
     let _ = T0.set(t0);
@@ -962,10 +993,12 @@ fn main() {
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
+                prof: [0.0; 2],
                 ev: (0..P).map(|_| Vec::with_capacity(est_events / threads / P * 5 / 4)).collect(),
                 cl: Vec::with_capacity(est_clicks / threads * 5 / 4),
             },
             |st, t| {
+                let tt = Instant::now();
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice = &event_files[fi][a..b];
@@ -975,11 +1008,17 @@ fn main() {
                     let slice = &click_files[fi][a..b];
                     csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl));
                 }
+                st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },
         );
         let aliases = links.join().unwrap();
         (p1, aliases)
     });
+    if profile {
+        let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
+        let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();
+        eprintln!("parse cpu: events {ev:.3} clicks {cl:.3}");
+    }
     lap("parse");
 
     // Phase 2: dedup events, route events and clicks by person.
@@ -1092,12 +1131,18 @@ fn main() {
     drop(p1);
     lap("dedup");
 
-    // Phase 3: group by person, sessions, attribution, aggregation.
+    // Phase 3: group by person, sessions, attribution, aggregation. Each
+    // worker writes its own user_daily file as soon as it runs out of work.
+    let user_dir = outdir.join("user_daily");
+    let camp_dir = outdir.join("campaign_daily");
+    std::fs::create_dir_all(&user_dir).expect("create user_daily");
+    std::fs::create_dir_all(&camp_dir).expect("create campaign_daily");
+    let wrote_user = std::sync::atomic::AtomicBool::new(false);
     let ncamp = ctx.camp_ids.len();
     // Largest person partitions first, so no thread is left with a big tail.
     let mut order: Vec<usize> = (0..Q).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(p2.iter().map(|w| w.pe[q].len() + w.pc[q].len()).sum::<usize>()));
-    let p3 = pool(
+    let p3 = pool_finish(
         threads,
         Q,
         || P3 {
@@ -1218,6 +1263,13 @@ fn main() {
             }
             st.prof[1] += tt.elapsed().as_secs_f64();
         },
+        |st, i| {
+            if !st.rows.days.is_empty() {
+                let r = std::mem::take(&mut st.rows);
+                write_user(&user_dir.join(format!("part-{i:03}.parquet")), r);
+                wrote_user.store(true, AtomicOrdering::Relaxed);
+            }
+        },
     );
     if profile {
         let mut tot = [0.0; 4];
@@ -1231,12 +1283,7 @@ fn main() {
     drop(p2);
     lap("sessions");
 
-    // Output.
-    let user_dir = outdir.join("user_daily");
-    let camp_dir = outdir.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir).expect("create user_daily");
-    std::fs::create_dir_all(&camp_dir).expect("create campaign_daily");
-
+    // Output: campaign_daily (user_daily files are already written).
     let nd = ctx.ndays;
     let mut acc = vec![[0i64; 4]; (ncamp + 1) * nd];
     for st in &p3 {
@@ -1246,31 +1293,10 @@ fn main() {
             }
         }
     }
-    let mut rows_by_worker: Vec<UserRows> = p3.into_iter().map(|s| s.rows).collect();
-    if rows_by_worker.iter().all(|r| r.days.is_empty()) {
-        rows_by_worker.truncate(1);
-    } else {
-        rows_by_worker.retain(|r| !r.days.is_empty());
+    if !wrote_user.load(AtomicOrdering::Relaxed) {
+        write_user(&user_dir.join("part-000.parquet"), UserRows::default());
     }
-    thread::scope(|scope| {
-        for (w, r) in rows_by_worker.into_iter().enumerate() {
-            let path = user_dir.join(format!("part-{w:03}.parquet"));
-            scope.spawn(move || {
-                out::write(
-                    &path,
-                    out::USER_SCHEMA,
-                    vec![
-                        out::Col::Str(r.names, r.name_ends),
-                        out::Col::I32(r.days),
-                        out::Col::I64(r.sessions),
-                        out::Col::I64(r.events),
-                        out::Col::I64(r.revenue),
-                        out::Col::OptStr(r.top, r.top_ends, r.top_defs),
-                    ],
-                )
-                .expect("write user_daily");
-            });
-        }
+    {
         let (mut ids, mut id_ends, mut chans, mut chan_ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut days, mut s, mut ps, mut rev, mut asst) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for c in 0..=ncamp {
@@ -1309,7 +1335,7 @@ fn main() {
             ],
         )
         .expect("write campaign_daily");
-    });
+    }
     lap("write");
     // Skip freeing everything: the OS reclaims it at exit.
     std::process::exit(0);

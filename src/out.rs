@@ -75,8 +75,8 @@ pub fn write(path: &Path, schema: &str, cols: Vec<Col>) -> parquet::errors::Resu
 pub const USER_SCHEMA: &str = "message user_daily {
   required binary user_id (STRING);
   required int32 day (DATE);
-  required int64 sessions;
-  required int64 events;
+  required int32 sessions;
+  required int32 events;
   required int64 revenue_cents;
   optional binary top_category (STRING);
 }";
