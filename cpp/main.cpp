@@ -2277,7 +2277,7 @@ int main(int argc, char** argv) {
     return b;
   };
   g_p1bits = pbits("P1BITS", ev_bytes);
-  g_p2bits = std::max(4, pbits("P2BITS", ev_bytes) - (getenv("P2BITS") ? 0 : 1));
+  g_p2bits = pbits("P2BITS", ev_bytes);
   BATCH = (u32)atoi(env("BATCH_KB", "64").c_str()) << 10;
   const u32 P1 = 1u << g_p1bits, P2 = 1u << g_p2bits;
   g_tc.resize(NT);
