@@ -2869,6 +2869,7 @@ int main(int argc, char** argv) {
       u64 z;
     };
     vector<vector<PS>> got(big.size());
+    vector<u64> glines(big.size()), gbytes(big.size());
     parallel(std::min<int>(NT, (int)big.size()), [&](int t) {
       for (size_t fi = (size_t)t; fi < big.size(); fi += (size_t)std::min<int>(NT, (int)big.size())) {
         const char* s0 = big[fi]->p;
@@ -2879,6 +2880,7 @@ int main(int argc, char** argv) {
           const char* b = (const char*)memchr(a, '\n', e0 - a);
           if (!b) break;
           ls = b;
+          glines[fi]++, gbytes[fi] += (u64)(b - a) + 1;
           const char* fp[7];
           u32 fl[7];
           if (!split(a, b, 7, fp, fl)) continue;
@@ -2907,9 +2909,12 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < all.size(); i++) ez.push_back(all[i].z);
     const u64 loose = ev_bytes / 24 + 1024;  // no event line is shorter than 24 bytes
     if (recover_key(ep, ez, 64, 0.75, loose, g_ekey)) {
-      u64 mx = 0;
-      for (u64 z : ez) mx = std::max(mx, ((z ^ g_ekey) * SI1) & SMASK);
-      g_nv = std::min<u64>(loose, mx + mx / 50 + 4096);  // indices past it just take the general path
+      // Rows in a file prefix come early in index, so the bound is the line
+      // count estimated from the average line; indices past it just take the
+      // general path.
+      u64 nl = 0, nb = 0;
+      for (size_t i = 0; i < big.size(); i++) nl += glines[i], nb += gbytes[i];
+      g_nv = std::min<u64>(loose, (u64)((double)ev_bytes * nl / std::max<u64>(nb, 1) * 1.03) + 4096);
       g_vsh = 0;
       while (((g_nv - 1) >> g_vsh) >= P1) g_vsh++;
       g_dev = true;
