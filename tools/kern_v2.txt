@@ -1,0 +1,7 @@
+# label  kind  target  [ENV=VAL] [--docker-flag]
+cur         docker  cur
+cur2        docker  cur
+cur_unconf  docker  cur  --security-opt=seccomp=unconfined
+noop        docker  noop
+noop_unconf docker  noop --security-opt=seccomp=unconfined
+musl        native  ./muslbin

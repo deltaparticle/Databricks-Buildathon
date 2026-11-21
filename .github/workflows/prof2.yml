@@ -14,6 +14,10 @@ on:
         description: "Variants file under tools/"
         required: false
         default: "kern_v1.txt"
+      envs:
+        description: "Extra env sets for the counters step (space separated, each VAR=VAL[,..])"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -71,6 +75,20 @@ jobs:
           echo "== native"; ./diag
           echo "== docker"; docker run --rm $FLAGS diag
           echo "== docker seccomp=unconfined"; docker run --rm $FLAGS --security-opt seccomp=unconfined diag
+      - name: Counters (native musl, vmstat deltas, syscalls)
+        run: |
+          K="thp_fault_alloc thp_fault_fallback thp_split_pmd pgfault pgalloc_normal pgalloc_dma32 pgfree thp_zero_page_alloc"
+          for e in "" ${{ github.event.inputs.envs || '' }}; do
+            for i in 1 2; do
+              cp /proc/vmstat v0
+              env $e DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) XL_TIMING=1 ./muslbin 2>&1 | grep -E "ms:" | sed 's/.*total=/total=/'
+              cp /proc/vmstat v1
+              echo "env[$e]: $(for k in $K; do a=$(grep "^$k " v0 | cut -d' ' -f2); b=$(grep "^$k " v1 | cut -d' ' -f2); echo -n "$k=$((b-a)) "; done)"
+            done
+          done
+          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) XL_TIMING=1 XL_MEMDBG=1 ./muslbin 2>&1 | grep -E "^\[mem\]|ms:"
+          sudo apt-get install -y -qq strace >/dev/null 2>&1 || true
+          strace -f -c -o st.txt env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./muslbin; head -25 st.txt
       - name: Exact (variant images vs cur)
         run: |
           pip install --quiet polars
