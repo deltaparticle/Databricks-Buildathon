@@ -109,12 +109,10 @@ jobs:
           echo "parallel cat of all 1.9 GB (16 readers): $(python3 -c "print(round($e-$s,3))")s"
           for i in 1 2 3; do
             drop
-            /usr/bin/time -f "COLD wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "COLD|s (parse|dedup|sessions|write)$|links built" | tr '
-' ' '; echo
+            /usr/bin/time -f "COLD wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "COLD|s (parse|dedup|sessions|write)$|links built" | tr '\n' ' '; echo
           done
           for i in 1 2; do
-            /usr/bin/time -f "WARM wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "WARM|s (parse|dedup|sessions|write)$" | tr '
-' ' '; echo
+            /usr/bin/time -f "WARM wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./target/release/shopping 2>&1 | grep -E "WARM|s (parse|dedup|sessions|write)$" | tr '\n' ' '; echo
           done
 
       - name: PGO A/B (profile-guided build vs normal build of this commit)
