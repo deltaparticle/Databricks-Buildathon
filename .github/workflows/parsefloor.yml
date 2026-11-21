@@ -1,0 +1,40 @@
+name: parsefloor
+
+# Parse-speed floor (tools/parsefloor.c) against the shipped pipeline's own
+# parse phase, same machine, same official 20M data.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          nproc; lscpu | grep "Model name"
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
+            grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
+          done
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          (cd lane && cargo build --release -q) && cp lane/target/release/pipeline lanebin
+          gcc -O3 -march=cascadelake -pthread -o parsefloor tools/parsefloor.c
+          clang -O3 -march=cascadelake -pthread -o parsefloor_clang tools/parsefloor.c
+      - name: Data
+        run: tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+      - name: Compare
+        run: |
+          N=$(nproc)
+          for i in 1 2 3; do
+            env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$N XL_TIMING=1 ./lanebin 2>&1 | grep -o "parse=[0-9.]*.*total=[0-9.]*"
+            ./parsefloor "$RUNNER_TEMP/p20" $N scan
+            ./parsefloor "$RUNNER_TEMP/p20" $N
+            ./parsefloor_clang "$RUNNER_TEMP/p20" $N
+          done
+          ./parsefloor "$RUNNER_TEMP/p20" 1
