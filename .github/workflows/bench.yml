@@ -7,6 +7,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit to A/B against (default: the previous commit)"
+        required: false
 
 jobs:
   bench:
@@ -14,6 +18,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Machine
         run: |
@@ -70,13 +76,29 @@ jobs:
           print("campaign_daily rows", c.height, "sessions", c["sessions"].sum(), "assisted", c["assisted_sessions"].sum())
           EOF
 
-      - name: Native runs (same machine, no container)
+      - name: A/B native runs (this commit vs base, alternating, same machine)
         run: |
-          for i in 1 2 3; do
-            out=$(mktemp -d)
-            /usr/bin/time -f "wall=%es user=%Us sys=%Ss maxrss=%MKB" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) SHOP_PROFILE=1 \
-              ./target/release/shopping 2>&1 | grep -E "wall=|cpu|s (parse|dedup|sessions|write)$" | tr '\n' ' '; echo
+          BASE="${{ github.event.inputs.base }}"; BASE=${BASE:-$(git rev-parse HEAD~1)}
+          echo "A = $(git rev-parse --short HEAD)   B = $(git rev-parse --short $BASE)"
+          git worktree add -q /tmp/base "$BASE"
+          (cd /tmp/base && RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=/tmp/base-target cargo build --release -q)
+          A=./target/release/shopping; B=/tmp/base-target/release/shopping
+          for i in 1 2 3 4 5 6; do
+            for which in A B; do
+              bin=$A; [ $which = B ] && bin=$B
+              out=$(mktemp -d)
+              /usr/bin/time -f "$which wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) $bin 2>> ab.txt
+            done
           done
+          cat ab.txt
+          python3 - <<'PY'
+          import re, statistics as st
+          rows = [l.split() for l in open("ab.txt") if l.startswith(("A ", "B "))]
+          for w in "AB":
+              walls = [float(r[1][5:]) for r in rows if r[0] == w]
+              users = [float(r[2][5:]) for r in rows if r[0] == w]
+              print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
+          PY
 
       - name: perf profile (line level)
         run: |
