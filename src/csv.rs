@@ -60,7 +60,7 @@ pub fn for_lines<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
 
 /// Bitmasks of `\n`, `,` and `"` in the 64 bytes at `p`.
 #[inline(always)]
-fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
+pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
         use std::arch::x86_64::*;

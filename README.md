@@ -1,8 +1,17 @@
-# Shopping Sessions: native Rust pipeline
+# Shopping Sessions
 
-One statically linked Rust binary (`FROM scratch` image) that implements `rules.md` exactly.
+**Shipped pipeline (`cpp/`, built by the Dockerfile):** a C++ pipeline adapted from
+[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)
+(commit `8452f3a`), reused under the organizers' open-reuse policy for this buildathon.
+All credit for its design goes to its author; our changes on top of it are in this
+repository's history.
 
-## Design
+**Reference pipeline (`src/`, Rust):** our own independent implementation of `rules.md`.
+CI diffs the shipped pipeline against it row by row on the 1M dev set and a generated
+20M set on every push, and runs the 36 fixtures against both.
+
+
+## Rust reference design
 
 1. **Parse (parallel).** Every CSV is memory-mapped and cut into ~4 MB newline-aligned chunks (the dialect never puts a newline inside a value, so any `\n` is a safe cut). Worker threads parse events and clicks; events are routed into 256 partitions by a hash of `event_id`. Links are joined on their own thread at the same time (union-find; the byte-wise smallest ID names the person).
 2. **Dedup (parallel over event_id partitions).** Open-addressing table keeps the copy with the smallest `ingest_ts`; validity of each copy is decided at parse time, so an invalid earliest copy still wins and drops the event. Survivors and clicks are re-routed into 256 partitions by person.

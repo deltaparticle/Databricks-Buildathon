@@ -11,6 +11,7 @@
 //! aggregate. Each worker writes its own user_daily Parquet file.
 
 mod csv;
+mod index;
 mod keys;
 mod out;
 mod sink;
@@ -704,6 +705,7 @@ impl SmallIndex {
 }
 
 struct P1<'r> {
+    idx: index::Index,
     tsc: ts::DateCache,
     prof: [f64; 2],
     ev: Sink<'r, Ev>,
@@ -911,6 +913,17 @@ fn bench_parse(ctx: &Ctx, path: &str) {
         let t = Instant::now();
         csv::scan::<7>(body, |f| parse_event(f, ctx, &mut b, &mut tsc));
         let full = t.elapsed().as_secs_f64();
+        let region2 = Region::new(body.len() + Sink::<Ev>::slack(P));
+        let mut b2 = Sink::<Ev>::new(&region2, P);
+        let mut idx = index::Index::new();
+        let t = Instant::now();
+        index::scan_indexed::<7>(body, &mut idx, |f| parse_event(f, ctx, &mut b2, &mut tsc));
+        let full2 = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut nn = 0usize;
+        index::scan_indexed::<7>(body, &mut idx, |f| nn += f[6].len());
+        let scan2 = t.elapsed().as_secs_f64();
+        eprintln!("   indexed: scan {:.1} ns/line  full {:.1} ns/line [{}]", scan2 * 1e9 / lines as f64, full2 * 1e9 / lines as f64, nn & 1);
         let t = Instant::now();
         let mut x = 0i64;
         let mut tsc2 = ts::DateCache::new();
@@ -1047,6 +1060,7 @@ fn main() {
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
+                idx: index::Index::new(),
                 tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
                 ev: Sink::new(&ev_region, P),
@@ -1057,12 +1071,14 @@ fn main() {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice = &event_files[fi][a..b];
-                    csv::scan::<7>(slice, |f| parse_event(f, &ctx, &mut st.ev, &mut st.tsc));
+                    let (idx, ev, tsc) = (&mut st.idx, &mut st.ev, &mut st.tsc);
+                    index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc));
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice = &click_files[fi][a..b];
                     let aliases = aliases_cell.wait();
-                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, aliases, &mut st.pc, &mut st.tsc));
+                    let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
+                    index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc));
                 }
                 st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },
