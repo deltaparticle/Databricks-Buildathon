@@ -1170,7 +1170,7 @@ fn main() {
                 return;
             }
             // Dense person ids and counts.
-            st.index.reset(ne / 8);
+            st.index.reset(ne / 20);
             st.persons.clear();
             st.eidx.clear();
             st.eoff.clear();

@@ -100,19 +100,50 @@ fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
     }
 }
 
-/// Call `f` with the `N` unquoted fields of every well-formed line of
-/// `data` (the same dialect as `for_lines` + `split`), in one SIMD pass.
-#[inline(always)]
-pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
-    let len = data.len();
-    let mut commas = [0usize; N];
-    let mut nc = 0usize; // commas seen in the current line (capped at N)
-    let mut quotes = 0u32; // quotes in the current line
-    let mut line_start = 0usize;
-    let mut tail = [0u8; 64];
+/// The state of one scan over a byte range: per-line comma positions and
+/// quote count, advanced one 64-byte block at a time.
+struct Stream<'a, const N: usize> {
+    data: &'a [u8],
+    base: usize,
+    line_start: usize,
+    commas: [usize; N],
+    /// Commas seen in the current line; N marks a line with too many.
+    nc: usize,
+    /// Quotes seen in the current line.
+    quotes: u32,
+}
 
-    let mut finish = |start: usize, end: usize, commas: &[usize; N], nc: usize, quotes: u32| {
-        if end == start || nc != N - 1 {
+impl<'a, const N: usize> Stream<'a, N> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, base: 0, line_start: 0, commas: [0; N], nc: 0, quotes: 0 }
+    }
+
+    #[inline(always)]
+    fn more(&self) -> bool {
+        self.base < self.data.len()
+    }
+
+    /// Commas of the current line in `c`: record them, or mark the line bad.
+    #[inline(always)]
+    fn add_commas(&mut self, c: u64) {
+        let cnt = c.count_ones() as usize;
+        if self.nc + cnt > N - 1 {
+            self.nc = N;
+            return;
+        }
+        let mut m = c;
+        while m != 0 {
+            self.commas[self.nc] = self.base + m.trailing_zeros() as usize;
+            self.nc += 1;
+            m &= m - 1;
+        }
+    }
+
+    /// One line [start, end) is complete: split it and call `f` if well formed.
+    #[inline(always)]
+    fn finish(&self, end: usize, f: &mut impl FnMut(&[&'a [u8]; N])) {
+        let (data, start) = (self.data, self.line_start);
+        if end == start || self.nc != N - 1 {
             return;
         }
         // Branch-free: each field strips one byte from each end when it is
@@ -122,7 +153,7 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
         let mut s = start;
         let mut wrapped = 0u32;
         for i in 0..N {
-            let e = if i + 1 < N { commas[i] } else { end };
+            let e = if i + 1 < N { self.commas[i] } else { end };
             // SAFETY: start <= commas[0] < ... < commas[N-2] < end <= data.len()
             // and end > start, so both indexes are clamped into [start, end).
             // They only matter when e >= s + 2, where they are s and e - 1.
@@ -134,59 +165,61 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
             out[i] = unsafe { data.get_unchecked(s + w..e - w) };
             s = e + 1;
         }
-        if wrapped != quotes {
+        if wrapped != self.quotes {
             return;
         }
         f(&out);
-    };
+    }
 
-    let mut base = 0usize;
-    while base < len {
-        let block: &[u8; 64] = if base + 64 <= len {
-            data[base..base + 64].try_into().unwrap()
+    /// Process the next 64-byte block.
+    #[inline(always)]
+    fn block(&mut self, f: &mut impl FnMut(&[&'a [u8]; N])) {
+        let len = self.data.len();
+        let mut tail = [0u8; 64];
+        let block: &[u8; 64] = if self.base + 64 <= len {
+            self.data[self.base..self.base + 64].try_into().unwrap()
         } else {
-            tail = [0u8; 64];
-            tail[..len - base].copy_from_slice(&data[base..]);
+            tail[..len - self.base].copy_from_slice(&self.data[self.base..]);
             &tail
         };
         let (mut nl, mut cm, mut qt) = masks(block);
-        // Commas of the current line in `c`: record them, or mark the line bad
-        // (nc = N) if it would have more than N-1.
-        #[inline(always)]
-        fn add_commas<const N: usize>(c: u64, base: usize, commas: &mut [usize; N], nc: &mut usize) {
-            let cnt = c.count_ones() as usize;
-            if *nc + cnt > N - 1 {
-                *nc = N;
-                return;
-            }
-            let mut m = c;
-            while m != 0 {
-                commas[*nc] = base + m.trailing_zeros() as usize;
-                *nc += 1;
-                m &= m - 1;
-            }
-        }
         while nl != 0 {
             let bit = nl & nl.wrapping_neg();
             let below = bit - 1;
-            add_commas(cm & below, base, &mut commas, &mut nc);
-            quotes += (qt & below).count_ones();
+            self.add_commas(cm & below);
+            self.quotes += (qt & below).count_ones();
             cm &= !below;
             qt &= !below;
-            let pos = base + bit.trailing_zeros() as usize;
-            finish(line_start, pos, &commas, nc, quotes);
-            line_start = pos + 1;
-            nc = 0;
-            quotes = 0;
+            let pos = self.base + bit.trailing_zeros() as usize;
+            self.finish(pos, f);
+            self.line_start = pos + 1;
+            self.nc = 0;
+            self.quotes = 0;
             nl ^= bit;
         }
-        add_commas(cm, base, &mut commas, &mut nc);
-        quotes += qt.count_ones();
-        base += 64;
+        self.add_commas(cm);
+        self.quotes += qt.count_ones();
+        self.base += 64;
     }
-    if line_start < len {
-        finish(line_start, len, &commas, nc, quotes);
+
+    /// Flush a last line that has no `\n`.
+    #[inline(always)]
+    fn end(&self, f: &mut impl FnMut(&[&'a [u8]; N])) {
+        if self.line_start < self.data.len() {
+            self.finish(self.data.len(), f);
+        }
     }
+}
+
+/// Call `f` with the `N` unquoted fields of every well-formed line of
+/// `data` (the same dialect as `for_lines` + `split`), in one SIMD pass.
+#[inline(always)]
+pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let mut a = Stream::<N>::new(data);
+    while a.more() {
+        a.block(&mut f);
+    }
+    a.end(&mut f);
 }
 
 #[cfg(test)]
