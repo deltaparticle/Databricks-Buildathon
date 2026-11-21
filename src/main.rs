@@ -32,7 +32,7 @@ const GAP: i64 = 30 * 60 * 1000;
 const REACH: i64 = 7 * DAY;
 const P_BITS: u32 = 9;
 const P: usize = 1 << P_BITS;
-const Q_BITS: u32 = 6;
+const Q_BITS: u32 = 7;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
 const CLICK_SLICES: usize = 4;
@@ -905,6 +905,10 @@ fn bench_parse(ctx: &Ctx, path: &str) {
         csv::scan::<7>(body, |f| n += f[6].len());
         let scan = t.elapsed().as_secs_f64();
         let mut b = Scatter0::new();
+        for v in b.0.iter_mut() {
+            v.resize(v.capacity(), Ev { ekey: 0, ukey: 0, ip: 0, ts: 0, cat: 0 });
+            v.clear();
+        }
         let t = Instant::now();
         csv::scan::<7>(body, |f| parse_event(f, ctx, &mut b.0));
         let full = t.elapsed().as_secs_f64();
@@ -927,7 +931,7 @@ fn bench_parse(ctx: &Ctx, path: &str) {
 struct Scatter0(Vec<Vec<Ev>>);
 impl Scatter0 {
     fn new() -> Self {
-        Scatter0((0..P).map(|_| Vec::new()).collect())
+        Scatter0((0..P).map(|_| Vec::with_capacity(4 << 20 >> P_BITS)).collect())
     }
 }
 

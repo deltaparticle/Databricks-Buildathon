@@ -115,25 +115,27 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
         if end == start || nc != N - 1 {
             return;
         }
+        // Branch-free: each field strips one byte from each end when it is
+        // wrapped in quotes; the line is valid only if that accounts for
+        // every quote in it.
         let mut out: [&'a [u8]; N] = [&[]; N];
         let mut s = start;
+        let mut wrapped = 0u32;
         for i in 0..N {
             let e = if i + 1 < N { commas[i] } else { end };
-            out[i] = &data[s..e];
+            // SAFETY: start <= commas[0] < ... < commas[N-2] < end <= data.len()
+            // and end > start, so both indexes are clamped into [start, end).
+            // They only matter when e >= s + 2, where they are s and e - 1.
+            let fi = s.min(end - 1);
+            let li = (e.max(s + 1) - 1).min(end - 1);
+            let (first, last) = unsafe { (*data.get_unchecked(fi), *data.get_unchecked(li)) };
+            let w = ((e >= s + 2) & (first == b'"') & (last == b'"')) as usize;
+            wrapped += 2 * w as u32;
+            out[i] = unsafe { data.get_unchecked(s + w..e - w) };
             s = e + 1;
         }
-        if quotes != 0 {
-            let mut wrapped = 0u32;
-            for field in out.iter_mut() {
-                let v = *field;
-                if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
-                    *field = &v[1..v.len() - 1];
-                    wrapped += 2;
-                }
-            }
-            if wrapped != quotes {
-                return;
-            }
+        if wrapped != quotes {
+            return;
         }
         f(&out);
     };
