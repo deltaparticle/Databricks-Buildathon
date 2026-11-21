@@ -155,16 +155,14 @@ jobs:
           echo "== phases (VERBOSE)"
           env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 ./cppbin 2>&1 >/dev/null | tail -14
 
-      - name: perf profile (line level)
+      - name: perf profile of the shipped C++ pipeline
         run: |
           sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
-          echo "perf: $PERF"; sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
-          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" cargo build --release
-          out=$(mktemp -d)
-          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) $PERF record -F 4999 -o perf.data ./target/release/shopping 2>/dev/null
-          $PERF stat -e task-clock,cycles,instructions,cache-misses,branch-misses,page-faults env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./target/release/shopping 2>&1 | tail -14
-          echo "===== top symbols"
-          $PERF report -i perf.data --no-children --sort sym --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -30
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          g++ -O3 -g -fno-omit-frame-pointer -march=x86-64-v3 -mtune=skylake-avx512 -std=c++20 -pthread -o /tmp/cpp_g cpp/main.cpp cpp/fallback.cpp
+          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) $PERF record -F 4999 -g -o perf.data /tmp/cpp_g 2>/dev/null
+          echo "===== top symbols (self)"
+          $PERF report -i perf.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -40
           echo "===== top source lines"
-          $PERF report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -v "^#" | grep -v "^$" | head -80
+          $PERF report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -60
