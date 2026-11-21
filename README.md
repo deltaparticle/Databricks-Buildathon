@@ -19,3 +19,13 @@ DATA_DIR=dev OUTPUT_DIR=out target/release/shopping && python3 scripts/compare.p
 ```
 
 `SHOP_PROFILE=1` prints phase timings to stderr.
+
+## Practice-size data on a low-memory machine
+
+The official generator holds the whole dataset in RAM before writing. `tools/gen-lowmem` is a copy that generates users in batches and appends each batch to the part files: every row lands in the same file as with the official generator, only the line order inside a file differs (which the rules make irrelevant; verified on the 1M dev set: identical files up to line order, and the pipeline output still matches the dev answer).
+
+```powershell
+cargo build --release --manifest-path tools/gen-lowmem/Cargo.toml
+tools/gen-lowmem/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --threads 8 --output D:/data/p20
+powershell -File tools/bench.ps1 -Data D:\data\p20 -Exe target\release\shopping.exe -Runs 3
+```
