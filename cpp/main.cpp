@@ -2969,8 +2969,7 @@ int main(int argc, char** argv) {
       g_C = (Ck*)big_alloc(g_nw * sizeof(Ck));
     }
     if (VERBOSE)
-      fprintf(stderr, "[%8.1f ms] dense keys: events %s (%zu pairs) clicks %s (%zu pairs)\n", now_ms(), ek ? "ok" : "no", ep.size(), ck ? "ok" : "no", cp.size()), fprintf(stderr, "            samples: %zu events, %zu clicks
-", es.size(), cs.size());
+      fprintf(stderr, "[%8.1f ms] dense keys: events %s (%zu pairs) clicks %s (%zu pairs)\n", now_ms(), ek ? "ok" : "no", ep.size(), ck ? "ok" : "no", cp.size()), fprintf(stderr, "            samples: %zu events, %zu clicks\n", es.size(), cs.size());
   }
 
   // ---- phase 2: dedup, person, scatter by person
