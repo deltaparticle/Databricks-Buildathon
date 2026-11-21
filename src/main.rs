@@ -385,7 +385,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut Sink<Ev>, tsc: &mut ts::
     if f[0].is_empty() {
         return;
     }
-    let ekey = keys::key(f[0]);
+    let ekey = keys::key(f[0], b'e');
     let ingest = ts::parse_c(f[3], tsc);
     let ingest_key = match ingest {
         Some(t) => (t.div_euclid(1000) + INGEST_BIAS).clamp(0, (1 << 40) - 1) as u64,
@@ -412,7 +412,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut Sink<Ev>, tsc: &mut ts::
             Some(i) if i - t <= DAY => {}
             _ => break 'valid,
         }
-        ev.ukey = keys::key(f[1]);
+        ev.ukey = keys::key(f[1], b'u');
         ev.ts = (t - ctx.ws) as u32;
         ev.ip = ingest_key << 24 | price as u64;
         if price > 0 {
@@ -432,11 +432,11 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>
         return;
     }
     let Some(camp) = ctx.campaigns.get(f[2]) else { return };
-    let ukey = keys::key(f[1]);
+    let ukey = keys::key(f[1], b'u');
     let h = mix(ukey);
     let person = aliases.person(ukey, h);
     let ph = if person == ukey { h } else { mix(person) };
-    out.push(part(ph, Q_BITS), PCl { person, ckey: keys::key(f[0]), ts: (t - ctx.cws) as u32, camp });
+    out.push(part(ph, Q_BITS), PCl { person, ckey: keys::key(f[0], b'k'), ts: (t - ctx.cws) as u32, camp });
 }
 
 /// Every linked ID that is not its person's name -> the name. A bitmap in
@@ -515,7 +515,7 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
     for m in &maps {
         csv::scan::<2>(body(m), |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
-                pairs.push((keys::key(f[0]), keys::key(f[1])));
+                pairs.push((keys::key(f[0], b'u'), keys::key(f[1], b'u')));
             }
         });
     }
@@ -594,7 +594,7 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
             continue;
         }
         let r = parent[s] as usize;
-        if best[r] == EMPTY || keys::cmp(k, best[r]).is_lt() {
+        if best[r] == EMPTY || keys::cmp(k, best[r], b'u').is_lt() {
             best[r] = k;
         }
     }
@@ -778,7 +778,7 @@ impl P3 {
 
     fn flush_day(&mut self, ctx: &Ctx, person: u64, day: i64, s: i64, e: i64, rev: i64) {
         let r = &mut self.rows;
-        keys::bytes(person, &mut r.names);
+        keys::bytes(person, b'u', &mut r.names);
         r.name_ends.push(r.names.len() as u32);
         r.days.push(day as i32);
         r.sessions.push(s as i32);
@@ -918,7 +918,7 @@ fn bench_parse(ctx: &Ctx, path: &str) {
         let tsp = t.elapsed().as_secs_f64() - scan;
         let t = Instant::now();
         let mut y = 0u64;
-        csv::scan::<7>(body, |f| y ^= keys::key(f[0]) ^ keys::key(f[1]));
+        csv::scan::<7>(body, |f| y ^= keys::key(f[0], b'e') ^ keys::key(f[1], b'u'));
         let kp = t.elapsed().as_secs_f64() - scan;
         let ns = |s: f64| s * 1e9 / lines as f64;
         eprintln!(
@@ -936,7 +936,7 @@ fn bench_alias(ctx: &Ctx, data: &Path) {
     for m in maps.iter().take(8) {
         csv::scan::<7>(body(m), |f| {
             if !f[1].is_empty() {
-                ukeys.push(keys::key(f[1]));
+                ukeys.push(keys::key(f[1], b'u'));
             }
         });
     }
@@ -1294,7 +1294,7 @@ fn main() {
                 let (c_lo, c_hi) = (st.coff[p] as usize, st.coff[p + 1] as usize);
                 st.evs[e_lo..e_hi].sort_unstable();
                 if c_hi - c_lo > 1 {
-                    st.cls[c_lo..c_hi].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ckey, b.ckey)));
+                    st.cls[c_lo..c_hi].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ckey, b.ckey, b'k')));
                 }
                 let person = st.persons[p];
                 st.person(&ctx, person, e_lo, e_hi, c_lo, c_hi);
