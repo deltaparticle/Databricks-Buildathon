@@ -19,7 +19,7 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -28,6 +28,19 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
 }
+
+/// Days since the epoch of the first of each month, 1900-01 to 2199-12.
+const TABLE_FIRST_YEAR: i64 = 1900;
+const TABLE_YEARS: usize = 300;
+static MONTH_START: [i32; TABLE_YEARS * 12] = {
+    let mut t = [0i32; TABLE_YEARS * 12];
+    let mut i = 0;
+    while i < TABLE_YEARS * 12 {
+        t[i] = days_from_civil(TABLE_FIRST_YEAR + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
 
 #[inline(always)]
 fn days_in_month(year: i64, month: i64) -> i64 {
@@ -65,7 +78,13 @@ fn civil19(s: &[u8]) -> Option<i64> {
     {
         return None;
     }
-    Some(days_from_civil(year, month, day) * DAY + ((hour * 60 + minute) * 60 + second) * SECOND)
+    let y = year - TABLE_FIRST_YEAR;
+    let days = if (0..TABLE_YEARS as i64).contains(&y) {
+        MONTH_START[(y * 12 + month - 1) as usize] as i64 + day - 1
+    } else {
+        days_from_civil(year, month, day)
+    };
+    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * SECOND)
 }
 
 /// Epoch milliseconds, `HUGE` for an F3 value beyond i64, or None if bad.
@@ -138,6 +157,12 @@ mod tests {
             assert_eq!(parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
         assert!(parse(b"2028-02-29T10:00:00Z").is_some());
+        for y in [1899i64, 1900, 1970, 2000, 2025, 2028, 2100, 2199, 2200] {
+            for m in 1..=12 {
+                let txt = format!("{y:04}-{m:02}-15T12:34:56Z");
+                assert_eq!(parse(txt.as_bytes()), Some(days_from_civil(y, m, 15) * DAY + 45_296_000), "{txt}");
+            }
+        }
         assert_eq!(parse(b"123456789012345678901"), Some(HUGE));
         assert_eq!(parse(b"2026-10-03T10:00:00-00:00"), parse(b"2026-10-03T10:00:00Z"));
     }

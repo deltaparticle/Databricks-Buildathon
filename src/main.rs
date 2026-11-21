@@ -35,6 +35,7 @@ const P: usize = 1 << P_BITS;
 const Q_BITS: u32 = 6;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
+const CLICK_SLICES: usize = 4;
 const CHUNK: usize = 2 << 20;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
@@ -156,9 +157,8 @@ struct Cl {
 #[derive(Clone, Copy)]
 struct PEv {
     person: u64,
-    ts: u32,
-    price: u32,
-    cat: u32,
+    /// ts << 32 | price << 8 | category: sorts by time.
+    w: u64,
 }
 
 /// A click, routed by person.
@@ -170,13 +170,6 @@ struct PCl {
     camp: u32,
 }
 
-/// One event of a grouped person.
-#[derive(Clone, Copy, Default)]
-struct E3 {
-    ts: u32,
-    price: u32,
-    cat: u32,
-}
 
 /// One click of a grouped person.
 #[derive(Clone, Copy, Default)]
@@ -393,6 +386,7 @@ fn load_ctx(data: &Path) -> Ctx {
     let mut names: BTreeSet<Vec<u8>> = product_rows.iter().map(|r| r.1.clone()).collect();
     names.insert(b"unknown".to_vec());
     let cat_names: Vec<Vec<u8>> = names.into_iter().collect();
+    assert!(cat_names.len() <= 256, "more than 255 product categories is not supported by the compact records");
     let cat_index: HashMap<&[u8], u32> =
         cat_names.iter().enumerate().map(|(i, n)| (n.as_slice(), i as u32)).collect();
     let mut products = Lookup::new(b"p");
@@ -568,9 +562,12 @@ impl Aliases {
 
 /// Union-find over the links: the byte-wise smallest ID names each person.
 fn build_aliases(paths: &[PathBuf]) -> Aliases {
-    let mut index = SmallIndex::new(1 << 16);
-    let mut ids: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
+    let bytes: usize = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)).sum();
+    // A link line is ~21 bytes and names two IDs; most IDs appear in ~1.2 lines.
+    let expect = bytes / 12 + 1024;
+    let mut index = SmallIndex::new(expect * 2);
+    let mut ids: Vec<u64> = Vec::with_capacity(expect);
+    let mut parent: Vec<u32> = Vec::with_capacity(expect);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let gp = parent[parent[x as usize] as usize];
@@ -603,6 +600,7 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
             }
         });
     }
+    let t_uf = Instant::now();
     let n = ids.len();
     let mut best = vec![EMPTY; n];
     for i in 0..n {
@@ -619,8 +617,15 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
             pairs.push((ids[i], best[r]));
         }
     }
-    Aliases::from_pairs(&pairs)
+    let t_pairs = t_uf.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let a = Aliases::from_pairs(&pairs);
+    if std::env::var_os("SHOP_PROFILE").is_some() {
+        eprintln!("links: parse+union until {:.3}s, best/pairs {:.3}s, table {:.3}s", T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64()) - t_pairs - t.elapsed().as_secs_f64(), t_pairs, t.elapsed().as_secs_f64());
+    }
+    a
 }
+static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Growable open-addressing u64 -> u32 index (dense ids).
 struct SmallIndex {
@@ -733,7 +738,7 @@ struct P3 {
     eidx: Vec<u32>,
     eoff: Vec<u32>,
     coff: Vec<u32>,
-    evs: Vec<E3>,
+    evs: Vec<u64>,
     cls: Vec<C3>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
@@ -809,7 +814,7 @@ impl P3 {
         let (mut ds, mut de, mut dr) = (0i64, 0i64, 0i64);
         let mut k = e_lo;
         while k < e_hi {
-            let start = self.evs[k].ts as i64;
+            let start = (self.evs[k] >> 32) as i64;
             let day = (ctx.ws + start).div_euclid(DAY);
             if day != cur_day {
                 if cur_day != i64::MIN {
@@ -822,20 +827,22 @@ impl P3 {
             let mut n = 0i64;
             let mut rev = 0i64;
             while k < e_hi {
-                let ev = self.evs[k];
-                let t = ev.ts as i64;
+                let w = self.evs[k];
+                let t = (w >> 32) as i64;
+                let price = (w >> 8) as u32 & 0xFF_FFFF;
+                let cat = w as u32 & 0xFF;
                 if t - last > GAP {
                     break;
                 }
                 last = t;
                 n += 1;
-                if ev.price > 0 {
-                    rev += ev.price as i64;
-                    let c = ev.cat as usize;
+                if price > 0 {
+                    rev += price as i64;
+                    let c = cat as usize;
                     if self.catsum[c] == 0 {
-                        self.touched.push(ev.cat);
+                        self.touched.push(cat);
                     }
-                    self.catsum[c] += ev.price as u64;
+                    self.catsum[c] += price as u64;
                 }
                 k += 1;
             }
@@ -886,6 +893,7 @@ impl P3 {
 
 fn main() {
     let t0 = Instant::now();
+    let _ = T0.set(t0);
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
     let lap = |what: &str| {
         if profile {
@@ -921,7 +929,7 @@ fn main() {
             let all: Vec<&InFile> = event_files.iter().chain(click_files.iter()).collect();
             scope.spawn(move || fadvise_all(&all));
         }
-        let links = scope.spawn(|| build_aliases(&link_paths));
+        let links = scope.spawn(|| { let t = Instant::now(); let a = build_aliases(&link_paths); if profile { eprintln!("links built in {:.3}s ({} aliases)", t.elapsed().as_secs_f64(), a.keys.iter().filter(|&&k| k != EMPTY).count()); } a });
         let p1 = pool(
             threads,
             n_event_chunks + click_chunks.len(),
@@ -951,7 +959,7 @@ fn main() {
     let nw = p1.len();
     let p2 = pool(
         threads,
-        P + nw,
+        CLICK_SLICES * nw + P,
         || P2 {
             pe: (0..Q).map(|_| Vec::with_capacity(est_events / threads / Q * 5 / 4)).collect(),
             pc: (0..Q).map(|_| Vec::with_capacity(est_clicks / threads / Q * 5 / 4)).collect(),
@@ -962,8 +970,11 @@ fn main() {
             prof: [0.0; 4],
         },
         |st, t| {
-            if t >= P {
-                let cl = &p1[t - P].cl;
+            // Click routing first (big tasks), then the event_id partitions.
+            if t < CLICK_SLICES * nw {
+                let all = &p1[t / CLICK_SLICES].cl;
+                let k = t % CLICK_SLICES;
+                let cl = &all[all.len() * k / CLICK_SLICES..all.len() * (k + 1) / CLICK_SLICES];
                 const AHEAD: usize = 8;
                 for i in 0..cl.len() {
                     if i + AHEAD < cl.len() {
@@ -975,6 +986,7 @@ fn main() {
                 }
                 return;
             }
+            let t = t - CLICK_SLICES * nw;
             let tt = Instant::now();
             let n: usize = p1.iter().map(|w| w.ev[t].len()).sum();
             if n == 0 {
@@ -1007,9 +1019,7 @@ fn main() {
                 let person = aliases.person(e.ukey, h);
                 st_pe[part(if person == e.ukey { h } else { mix(person) }, Q_BITS)].push(PEv {
                     person,
-                    ts: e.ts,
-                    price: price as u32,
-                    cat: e.cat,
+                    w: (e.ts as u64) << 32 | price << 8 | e.cat as u64,
                 });
             };
             let mut dup_refs: Vec<(u32, u32)> = Vec::new();
@@ -1057,6 +1067,9 @@ fn main() {
 
     // Phase 3: group by person, sessions, attribution, aggregation.
     let ncamp = ctx.camp_ids.len();
+    // Largest person partitions first, so no thread is left with a big tail.
+    let mut order: Vec<usize> = (0..Q).collect();
+    order.sort_by_key(|&q| std::cmp::Reverse(p2.iter().map(|w| w.pe[q].len() + w.pc[q].len()).sum::<usize>()));
     let p3 = pool(
         threads,
         Q,
@@ -1077,7 +1090,8 @@ fn main() {
             rows: UserRows::default(),
             prof: [0.0; 4],
         },
-        |st, q| {
+        |st, t| {
+            let q = order[t];
             let tt = Instant::now();
             let ne: usize = p2.iter().map(|w| w.pe[q].len()).sum();
             if ne == 0 {
@@ -1109,7 +1123,7 @@ fn main() {
             }
             st.eoff.push(run);
             st.evs.clear();
-            st.evs.resize(ne, E3::default());
+            st.evs.resize(ne, 0);
             {
                 let mut cursor: Vec<u32> = st.eoff[..np].to_vec();
                 let mut k = 0;
@@ -1117,7 +1131,7 @@ fn main() {
                     for e in &w.pe[q] {
                         let i = st.eidx[k] as usize;
                         k += 1;
-                        st.evs[cursor[i] as usize] = E3 { ts: e.ts, price: e.price, cat: e.cat };
+                        st.evs[cursor[i] as usize] = e.w;
                         cursor[i] += 1;
                     }
                 }
@@ -1168,7 +1182,7 @@ fn main() {
             for p in 0..np {
                 let (e_lo, e_hi) = (st.eoff[p] as usize, st.eoff[p + 1] as usize);
                 let (c_lo, c_hi) = (st.coff[p] as usize, st.coff[p + 1] as usize);
-                st.evs[e_lo..e_hi].sort_unstable_by_key(|e| e.ts);
+                st.evs[e_lo..e_hi].sort_unstable();
                 if c_hi - c_lo > 1 {
                     st.cls[c_lo..c_hi].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ckey, b.ckey)));
                 }
