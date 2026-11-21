@@ -1,0 +1,7 @@
+# label  kind  target  [ENV=VAL] [--docker-flag]
+cur         docker  cur
+cur2        docker  cur
+rd32        docker  cur  XL_RD=32
+rd64        docker  cur  XL_RD=64
+rd256       docker  cur  XL_RD=256
+fa0         docker  cur  XL_FA=0
