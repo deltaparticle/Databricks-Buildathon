@@ -58,6 +58,10 @@ jobs:
             echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
           done
 
+      - name: Phase log (VERBOSE)
+        run: |
+          for d in p20 dev; do echo "== $d"; env DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) VERBOSE=1 ./cppbin 2>&1 >/dev/null | tail -16; done
+
       - name: Docker build
         run: time docker build -t shopping:ci .
 
