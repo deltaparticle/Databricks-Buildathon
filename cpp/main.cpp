@@ -1185,14 +1185,7 @@ static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char
   const u32 p = (u32)(hash64(eid) >> p1sh);
   u32 f = fill[p];
   Ev* d = (Ev*)(wc + (size_t)p * 128 + f);
-#if defined(__AVX2__)
-  {  // one 32-byte store instead of five
-    const u64 w2 = (u64)(valid ? (u32)rel : TS_INVALID) | ((u64)ikey << 32);
-    _mm256_storeu_si256((__m256i*)d, _mm256_set_epi64x((long long)(u64)pc, (long long)w2, (long long)uid, (long long)eid));
-  }
-#else
   d->eid = eid, d->uid = uid, d->ts = valid ? (u32)rel : TS_INVALID, d->ingest = ikey, d->pc = pc, d->pad = 0;
-#endif
   f += 32;
   if (UNLIKELY(f == 128)) {
     tc.evs.flush(p, 128);
@@ -1658,11 +1651,7 @@ static void phase2_partition(TC& tc, u32 p) {
       const u32 q = (u32)(hash64(uid) >> sh2);
       u32 f = fill[q];
       Ev2* d = (Ev2*)(wc + (size_t)q * 128 + f);
-#if defined(__AVX2__)
-      _mm_storeu_si128((__m128i*)d, _mm_set_epi64x((long long)(((u64)ts << 32) | r[j].pc), (long long)uid));
-#else
       d->uid = uid, d->tspc = ((u64)ts << 32) | r[j].pc;
-#endif
       f += 16;
       if (UNLIKELY(f == 128)) {
         tc.pes.flush(q, 128);
