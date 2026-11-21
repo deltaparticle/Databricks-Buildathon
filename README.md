@@ -2,13 +2,19 @@
 
 **Shipped pipeline (`lane/`, built by the Dockerfile):** Team 67's
 [Express Lane](https://github.com/jason-scheffel/express-lane) (commit `612962f`),
-used unchanged under its MIT license (copyright notice in `lane/LICENSE`) and the
-organizers' open-reuse policy for this buildathon. All credit for its design and code
-goes to Team 67.
+used under its MIT license (copyright notice in `lane/LICENSE`) and the organizers'
+open-reuse policy for this buildathon. All credit for its design and code goes to
+Team 67. Our changes: code the shipped build never compiles or calls is removed (the
+`stats`, `knobs`, `testkeys`, `pmu` and `tl` feature-gated code, 75 unused functions,
+types and constants, and an unused Parquet write method), about 1,250 lines. The
+machine code of the shipped binary is otherwise unchanged (checked function by function
+with `tools/asmcmp.py`), and CI checks the output row by row against the unmodified
+build.
 
-**Previous pipeline (`cpp/`, no longer shipped):** a C++ pipeline adapted from
-[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)
-(commit `954c08d`), with our changes on top in this repository's history.
+**Earlier attempts:** see [`attempts/`](attempts/README.md). Our C++ dense-index
+experiment is in `cpp/` (adapted from
+[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)),
+the 0.64 s submission in `attempts/cpp-1bacb58/`.
 
 **Reference pipeline (`src/`, Rust):** our own independent implementation of `rules.md`.
 CI (`.github/workflows/lane.yml`) runs the 36 fixtures and diffs the shipped pipeline

@@ -14,7 +14,7 @@ on:
       base:
         description: "Commit whose Dockerfile image to time against"
         required: false
-        default: 1bacb58
+        default: 7286264
 
 permissions:
   contents: read
@@ -42,11 +42,16 @@ jobs:
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
           (cd lane && cargo build --release -q)
           cp lane/target/release/pipeline lanebin
+          # the unmodified Express Lane as first shipped (7286264), for an exact output diff
+          git worktree add -q /tmp/orig 7286264
+          (cd /tmp/orig/lane && cargo build --release -q)
+          cp /tmp/orig/lane/target/release/pipeline origbin
           pip install --quiet polars
 
       - name: Fixtures
         run: |
           echo "lane:"; python3 scripts/run_fixtures.py fixtures -- "$PWD/lanebin" | tail -2
+          echo "unmodified:"; python3 scripts/run_fixtures.py fixtures -- "$PWD/origbin" | tail -1
           echo "reference:"; python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -1
 
       - name: Data
@@ -57,18 +62,23 @@ jobs:
           tools/gen-lowmem/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/s20" 2>&1 | tail -1
           du -sh "$RUNNER_TEMP"/dev "$RUNNER_TEMP"/p20 "$RUNNER_TEMP"/s20
 
-      - name: Exact diff against the Rust reference
+      - name: Exact diff against the Rust reference and the unmodified build
         run: |
           for d in dev p20 s20; do
-            a=$(mktemp -d); b=$(mktemp -d)
+            a=$(mktemp -d); b=$(mktemp -d); o=$(mktemp -d)
             DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a" NCPU=$(nproc) ./lanebin
             DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
-            echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$o" NCPU=$(nproc) ./origbin
+            echo "$d vs reference: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+            echo "$d vs unmodified: $(cd scripts && python3 compare.py "$a" "$o" | tail -1)"
+            # byte-level: same files, same contents
+            (cd "$a" && find . -type f | sort | xargs sha256sum) > a.sum; (cd "$o" && find . -type f | sort | xargs sha256sum) > o.sum
+            cmp -s a.sum o.sum && echo "$d parquet files byte-identical to unmodified" || { echo "$d parquet bytes differ from unmodified"; diff a.sum o.sum | head; }
           done
 
       - name: Container A/B, scorer flags (alternating, same machine)
         run: |
-          BASE="${{ github.event.inputs.base }}"; BASE=${BASE:-1bacb58}
+          BASE="${{ github.event.inputs.base }}"; BASE=${BASE:-7286264}
           docker build -q -t cur . >/dev/null
           git worktree add -q /tmp/base "$BASE"
           docker build -q -t base /tmp/base >/dev/null
