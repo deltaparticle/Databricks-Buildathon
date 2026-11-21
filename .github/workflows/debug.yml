@@ -90,6 +90,7 @@ jobs:
           done
       - name: BOLT
         run: |
+          set +e
           [ -n "$BOLT" ] && [ -x "$BOLT" ] || exit 0
           $BOLT --version | head -3
           echo "== hot code size (largest functions, bytes)"; nm -S --size-sort -C ./relocs | tail -12
@@ -108,7 +109,7 @@ jobs:
           agg ./grelocs gprof.fdata
           # exact edge counts: BOLT instrumentation of a glibc build that leaves via exit() (--cfg bolt_instr)
           $BOLT ./ginstsrc -instrument -instrumentation-file=$PWD/inst.fdata -o ./ginst 2>&1 | grep -E "BOLT-(ERROR)" | tail -4
-          DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./ginst >/dev/null 2>&1; echo "instrumented run exit=$?"; ls -l inst.fdata || true
+          DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./ginst >/dev/null 2>ginst.err; echo "instrumented run exit=$?"; tail -3 ginst.err; ls -l inst.fdata || true
           bo() {  # out, in, profile, opts...
             o=$1; i=$2; d=$3; shift 3
             $BOLT $i -o ./$o -data=$d "$@" > bo-$o.log 2>&1
