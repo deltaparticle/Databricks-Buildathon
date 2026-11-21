@@ -1,0 +1,44 @@
+# label  binary  env...   (first line = baseline; runtime knobs of lane/)
+base        ./lanebin
+base2       ./lanebin
+pin0        ./lanebin XL_PIN=0
+pin1        ./lanebin XL_PIN=1
+qord0       ./lanebin XL_QORD=0
+qord1       ./lanebin XL_QORD=1
+ch2048      ./lanebin XL_CH=2048
+ch4096      ./lanebin XL_CH=4096
+ch16384     ./lanebin XL_CH=16384
+rd256       ./lanebin XL_RD=256
+rd1024      ./lanebin XL_RD=1024
+relk4       ./lanebin XL_RELK=4
+relk16      ./lanebin XL_RELK=16
+frlag16     ./lanebin XL_FRLAG=16
+frlag64     ./lanebin XL_FRLAG=64
+spin100     ./lanebin XL_SPIN=100
+spin1500    ./lanebin XL_SPIN=1500
+donate8     ./lanebin XL_DONATE=8
+donate32    ./lanebin XL_DONATE=32
+ckix1       ./lanebin XL_CKIX=1
+ioadv0      ./lanebin XL_IOADV=0
+ioadv1      ./lanebin XL_IOADV=1
+pf1         ./lanebin XL_PF=1
+nt0         ./lanebin XL_NT=0
+rel0        ./lanebin XL_REL=0
+free0       ./lanebin XL_FREE=0
+ovl0        ./lanebin XL_OVL=0
+recycle0    ./lanebin XL_RECYCLE=0
+pparts0     ./lanebin XL_PPARTS=0
+psetup0     ./lanebin XL_PSETUP=0
+r3_0        ./lanebin XL_R3=0
+anonr0      ./lanebin XL_ANONR=0
+notouch0    ./lanebin XL_NOTOUCH=0
+first4k     ./lanebin XL_FIRST4K=1
+prefault    ./lanebin XL_PREFAULT=1
+nohuge      ./lanebin XL_NOHUGE=1
+endrel1     ./lanebin XL_ENDREL=1
+endrel2     ./lanebin XL_ENDREL=2
+c8res0      ./lanebin XL_C8RES=0
+pinstart    ./lanebin XL_PINSTART=1 XL_PIN=2
+rgrel1      ./lanebin XL_RGREL=1
+rgrel0      ./lanebin XL_RGREL=0
+pool0       ./lanebin XL_POOL=0
