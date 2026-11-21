@@ -81,7 +81,7 @@ pub const fn env_u32(s: Option<&str>, d: u32) -> u32 {
 pub const BB: u32 = env_u32(option_env!("XL_BB"), 15);
 pub const SPIN_US_DEFAULT: u64 = env_u32(option_env!("XL_SPIN_DEF"), 400) as u64;
 pub const BSIZE: usize = 1 << BB;
-pub const UB: u32 = env_u32(option_env!("XL_UB"), 11); // was 12; 11 with R3 off measured 1.7-1.8% faster on CI
+pub const UB: u32 = env_u32(option_env!("XL_UB"), 12);
 pub const UBSIZE: usize = 1 << UB;
 pub const DAY_MS: i64 = 86_400_000;
 pub const WEEK_MS: u64 = 604_800_000;
