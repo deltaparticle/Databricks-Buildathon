@@ -1128,7 +1128,7 @@ fn main() {
         }
         eprintln!("dedup cpu: bitmap {:.3} emit {:.3}", tot[0], tot[1]);
     }
-    drop(p1);
+    std::mem::forget(p1); // freed at exit; freeing here would stall the critical path
     lap("dedup");
 
     // Phase 3: group by person, sessions, attribution, aggregation. Each
@@ -1280,7 +1280,7 @@ fn main() {
         }
         eprintln!("session cpu: group {:.3} sweep {:.3}", tot[0], tot[1]);
     }
-    drop(p2);
+    std::mem::forget(p2); // freed at exit
     lap("sessions");
 
     // Output: campaign_daily (user_daily files are already written).
