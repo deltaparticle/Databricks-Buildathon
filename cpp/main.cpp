@@ -1117,17 +1117,23 @@ static u64 inv_odd(u64 a) {  // inverse modulo 2^64 of an odd number
   for (int i = 0; i < 6; i++) x *= 2 - a * x;
   return x;
 }
-static u8 B36T[256];  // digit value, or 64 for a character that is not a base-36 digit
-static AINLINE u64 b36_raw(u64 raw) {  // the canonical base-36 value of a raw ID's digits, or ~0
-  const u32 len = raw_len(raw);
+// The canonical base-36 value of a raw ID's digits, or ~0: eight bytes at
+// once (SWAR). The digits are moved to the top so that the last one is the
+// least significant; the empty bytes below are zero digits.
+static AINLINE u64 b36_raw(u64 raw) {
+  const u32 len = raw_len(raw);  // at least 1
   if ((raw & 0xFF) == '0' && len > 1) return ~0ull;  // a leading zero: not canonical
-  u64 v = 0;
-  u32 bad = 0;
-  for (u32 i = 0; i < len; i++) {
-    const u32 d = B36T[(raw >> (8 * i)) & 0xFF];
-    bad |= d, v = v * 36 + (d & 63);
-  }
-  return (bad & 64) ? ~0ull : v;
+  const u64 H = 0x8080808080808080ull, O = 0x0101010101010101ull;
+  const u32 sh = 8 * (8 - len);
+  const u64 x = raw << sh, nz = ~0ull << sh;
+  const u64 y = x & ~H;
+  const u64 dig = ((y + O * (0x80 - '0')) & ~(y + O * (0x7F - '9'))) & H;
+  const u64 let = ((y + O * (0x80 - 'a')) & ~(y + O * (0x7F - 'z'))) & H;
+  if ((~(dig | let) & nz & H) | (x & H)) return ~0ull;  // a byte that is not a digit
+  const u64 d = x - (nz & O) * 0x30 - (let >> 7) * 39;
+  const u64 p2 = (d & 0x00FF00FF00FF00FFull) * 36 + ((d >> 8) & 0x00FF00FF00FF00FFull);
+  const u64 p4 = (p2 & 0x0000FFFF0000FFFFull) * 1296 + ((p2 >> 16) & 0x0000FFFF0000FFFFull);
+  return (p4 & 0xFFFFFFFFull) * 1679616ull + (p4 >> 32);
 }
 static AINLINE u64 zval(u64 raw) {  // (index * M1) ^ key, or ~0 for an ID that does not decode
   if (!is_raw(raw)) return ~0ull;
@@ -2854,7 +2860,6 @@ int main(int argc, char** argv) {
   const u32 P1 = 1u << g_p1bits, P2 = 1u << g_p2bits;
   g_tc.resize(NT);
   SI1 = inv_odd(SM1) & SMASK, SI2 = inv_odd(SM2) & SMASK;
-  for (int c = 0; c < 256; c++) B36T[c] = c >= '0' && c <= '9' ? (u8)(c - '0') : c >= 'a' && c <= 'z' ? (u8)(c - 'a' + 10) : 64;
   if (!getenv("NODENSE") && !ev_files.empty()) {
     // The event key, from the first 512 KB of the biggest event files: one
     // user ID's events less than 10 s apart are nearly always in one session,
