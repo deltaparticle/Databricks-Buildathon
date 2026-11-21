@@ -118,6 +118,43 @@ jobs:
               print(f"{w}: median wall {st.median(walls):.3f}s  median user {st.median(users):.2f}s  (n={len(walls)})")
           PY
 
+      - name: Compiler sweep (same source, round-robin, exact output check)
+        run: |
+          clang++ --version | head -1; g++ --version | head -1
+          AVX512=0; grep -q avx512bw /proc/cpuinfo && AVX512=1; echo "avx512bw=$AVX512"
+          SRC="cpp/main.cpp cpp/fallback.cpp"
+          declare -A V
+          V[gcc_v3]="g++ -O3 -march=x86-64-v3 -mtune=skylake-avx512"
+          V[gcc_O2_v3]="g++ -O2 -march=x86-64-v3 -mtune=skylake-avx512"
+          V[clang_v3]="clang++ -O3 -march=x86-64-v3 -mtune=skylake-avx512"
+          V[clang_v3_lto]="clang++ -O3 -flto -march=x86-64-v3 -mtune=skylake-avx512"
+          if [ $AVX512 = 1 ]; then
+            V[gcc_v4]="g++ -O3 -march=x86-64-v4 -mtune=icelake-server"
+            V[clang_v4]="clang++ -O3 -march=x86-64-v4 -mtune=icelake-server"
+            V[gcc_cascade]="g++ -O3 -march=cascadelake"
+          fi
+          for k in "${!V[@]}"; do ${V[$k]} -std=c++20 -pthread -o /tmp/c_$k $SRC 2> /tmp/c_$k.err || { echo "$k build failed"; tail -3 /tmp/c_$k.err; unset V[$k]; continue; }
+            a=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) /tmp/c_$k
+            b=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$b" NCPU=$(nproc) ./cppbin
+            echo "$k output vs shipped: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"; done
+          rm -f comp.txt
+          for i in 1 2 3 4 5 6; do
+            for k in "${!V[@]}"; do
+              /usr/bin/time -f "$k wall=%e user=%U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) /tmp/c_$k > /dev/null 2>> comp.txt
+            done
+          done
+          python3 - <<'PY'
+          import statistics as st, collections
+          d = collections.defaultdict(lambda: ([], []))
+          for l in open("comp.txt"):
+              p = l.split()
+              if len(p) == 3 and p[1].startswith("wall="):
+                  d[p[0]][0].append(float(p[1][5:])); d[p[0]][1].append(float(p[2][5:]))
+          base = st.median(d["gcc_v3"][0])
+          for k, (w, u) in sorted(d.items(), key=lambda kv: st.median(kv[1][0])):
+              print(f"{k:13s} median wall {st.median(w):.3f}s ({(st.median(w)/base-1)*100:+.1f}%)  user {st.median(u):.2f}s  n={len(w)}")
+          PY
+
       - name: perf profile of the shipped C++ pipeline
         run: |
           sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
