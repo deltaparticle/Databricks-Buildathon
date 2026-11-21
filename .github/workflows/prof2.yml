@@ -1,68 +1,102 @@
-name: prof2
+name: kern
 
-# Where does the container add time? Internal phase timings inside the
-# container, with and without --cpus, docker's own StartedAt/FinishedAt, and a
-# noop that touches as much memory as the pipeline (exit teardown cost).
+# Kernel / container overhead study (exp/kernel): native glibc vs native musl
+# vs container, seccomp on/off, interleaved on one machine, under THP madvise
+# and always; perf of the containerized run (system-wide, comm=pipeline).
 on:
   workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Rounds"
+        required: false
+        default: "10"
+      variants:
+        description: "Variants file under tools/"
+        required: false
+        default: "kern_v1.txt"
 
 permissions:
   contents: read
 
 jobs:
-  prof2:
+  kern:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        thp: [madvise, always, always_b]
     steps:
       - uses: actions/checkout@v4
       - name: Machine
         run: |
-          nproc; lscpu | grep "Model name"
+          nproc; lscpu | grep -E "Model name"; uname -r; free -g
           for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
             grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
           done
+          cat /proc/cmdline
+          grep -E "INIT_ON_ALLOC|INIT_ON_FREE|TRANSPARENT_HUGEPAGE|READ_ONLY_THP|PAGE_TABLE_ISOLATION" /boot/config-$(uname -r) || true
+          grep . /sys/devices/system/cpu/vulnerabilities/* | sed 's|.*/||'
+          sudo cat /sys/kernel/debug/fault_around_bytes 2>/dev/null || true
+          docker info 2>/dev/null | grep -iE "Kernel|Runtime|seccomp|Security|cgroup" || true
+      - name: THP
+        run: |
+          case "${{ matrix.thp }}" in always*) echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled ;; esac
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+          grep . /sys/kernel/mm/transparent_hugepage/shmem_enabled /sys/kernel/mm/transparent_hugepage/khugepaged/defrag 2>/dev/null || true
       - name: Build
         run: |
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          (cd lane && cargo build --release -q) && cp lane/target/release/pipeline lanebin
           docker build -q -t cur . >/dev/null
-          printf '#include <stdlib.h>\n#include <string.h>\nint main(int c,char**v){size_t n=c>1?strtoull(v[1],0,10)<<20:0; if(n){char*p=malloc(n); memset(p,1,n); return p[n/2]==2;} return 0;}\n' > mem.c
-          gcc -O2 -static -o mem mem.c
-          mkdir -p memimg && cp mem memimg/ && printf 'FROM scratch\nCOPY mem /mem\nUSER 1000:1000\nENTRYPOINT ["/mem"]\n' > memimg/Dockerfile
-          docker build -q -t mem memimg >/dev/null
-      - name: Data
-        run: tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
-      - name: Runs
-        run: |
-          N=$(nproc)
-          FLAGS="--network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --memory 14g --memory-swap 14g --user 1000:1000"
-          one() {  # label, extra flags, image, args...
-            label=$1; extra=$2; img=$3; shift 3
-            out=$(mktemp -d); chmod 777 "$out"
-            s=$(date +%s.%N)
-            id=$(docker create $FLAGS $extra -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU=$N -e XL_TIMING=1 "$img" "$@")
-            c=$(date +%s.%N)
-            docker start -a "$id" > /dev/null 2> err.txt
-            e=$(date +%s.%N)
-            st=$(docker inspect -f '{{.State.StartedAt}} {{.State.FinishedAt}}' "$id")
-            docker rm "$id" > /dev/null
-            r=$(date +%s.%N)
-            inner=$(python3 -c "
-          from datetime import datetime
-          a,b='$st'.split()
-          f=lambda x: datetime.strptime(x[:26].rstrip('Z'), '%Y-%m-%dT%H:%M:%S.%f')
-          print(round((f(b)-f(a)).total_seconds(),3))")
-            tot=$(grep -o 'total=[0-9.]*' err.txt | head -1)
-            echo "$label create=$(python3 -c "print(round($c-$s,3))") start-to-exit=$(python3 -c "print(round($e-$c,3))") rm=$(python3 -c "print(round($r-$e,3))") docker_started_to_finished=$inner internal_$tot"
-          }
-          for i in 1 2 3 4 5; do
-            one cur_cpus "--cpus $N" cur
-            one cur_nocpus "" cur
-            one mem0 "--cpus $N" mem 0
-            one mem500 "--cpus $N" mem 500
+          docker create --name xcur cur >/dev/null && docker cp xcur:/pipeline ./muslbin && docker rm xcur >/dev/null
+          gcc -O2 -static -o diag tools/diag.c
+          printf 'int main(void){return 0;}\n' > noop.c && gcc -O2 -static -o noop noop.c
+          for b in diag noop; do
+            mkdir -p img-$b && cp $b img-$b/ && printf 'FROM scratch\nCOPY %s /%s\nUSER 1000:1000\nCMD ["/%s"]\n' $b $b $b > img-$b/Dockerfile
+            docker build -q -t $b img-$b >/dev/null
           done
-          echo "== cur, internal phases, with --cpus"
-          out=$(mktemp -d); chmod 777 "$out"
-          docker run --rm $FLAGS --cpus $N -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU=$N -e XL_TIMING=1 cur 2>&1 >/dev/null | grep "ms:"
-          echo "== native, internal phases"
-          docker create --name x cur >/dev/null; docker cp x:/pipeline ./pipeline; docker rm x >/dev/null
-          for i in 1 2 3; do /usr/bin/time -f "native wall=%e" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$N XL_TIMING=1 ./pipeline 2>&1 | grep -E "ms:|wall="; done
+          # extra variant images: tools/kern_build.sh may build more (label -> image name)
+          [ -f tools/kern_build.sh ] && bash tools/kern_build.sh || true
+          docker images | head -20
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
+      - name: Data (official generator, 20M, seed 42)
+        run: |
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          du -sh "$RUNNER_TEMP/p20"
+      - name: Diag
+        run: |
+          FLAGS="--network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --memory 14g --memory-swap 14g --user 1000:1000 --cpus $(nproc)"
+          echo "== native"; ./diag
+          echo "== docker"; docker run --rm $FLAGS diag
+          echo "== docker seccomp=unconfined"; docker run --rm $FLAGS --security-opt seccomp=unconfined diag
+      - name: Exact (variant images vs cur)
+        run: |
+          pip install --quiet polars
+          FLAGS="--network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 14g --memory-swap 14g --user 1000:1000 --cpus $(nproc)"
+          ref=$(mktemp -d); chmod 777 $ref
+          docker run --rm $FLAGS -v "$RUNNER_TEMP/p20":/data:ro -v $ref:/output -e NCPU=$(nproc) cur
+          for img in $(docker images --format '{{.Repository}}' | grep '^v-' || true); do
+            o=$(mktemp -d); chmod 777 $o
+            docker run --rm $FLAGS -v "$RUNNER_TEMP/p20":/data:ro -v $o:/output -e NCPU=$(nproc) $img
+            echo "$img vs cur: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
+          done
+      - name: Timing (interleaved)
+        run: python3 tools/kern.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds || '10' }} tools/${{ github.event.inputs.variants || 'kern_v1.txt' }}
+      - name: perf (container, system-wide, comm pipeline)
+        run: |
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          FLAGS="--network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --memory 14g --memory-swap 14g --user 1000:1000 --cpus $(nproc)"
+          for img in cur $(docker images --format '{{.Repository}}' | grep '^v-' | head -2 || true); do
+            o=$(mktemp -d); chmod 777 $o
+            id=$(docker create $FLAGS -v "$RUNNER_TEMP/p20":/data:ro -v $o:/output -e NCPU=$(nproc) $img)
+            sudo $PERF record -a -g -F 4999 -o perf-$img.data -- docker start -a $id >/dev/null 2>&1
+            docker rm $id >/dev/null
+            echo "===== $img: by dso (comm pipeline)"
+            sudo $PERF report -i perf-$img.data --comm pipeline --no-children --sort dso --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -5
+            echo "===== $img: kernel symbols (comm pipeline)"
+            sudo $PERF report -i perf-$img.data --comm pipeline --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | grep "\[k\]" | head -30
+            echo "===== $img: all comms"
+            sudo $PERF report -i perf-$img.data --no-children --sort comm --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -12
+          done
