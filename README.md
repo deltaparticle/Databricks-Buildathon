@@ -1,0 +1,21 @@
+# Shopping Sessions: native Rust pipeline
+
+One statically linked Rust binary (`FROM scratch` image) that implements `rules.md` exactly.
+
+## Design
+
+1. **Parse (parallel).** Every CSV is memory-mapped and cut into ~4 MB newline-aligned chunks (the dialect never puts a newline inside a value, so any `\n` is a safe cut). Worker threads parse events and clicks; events are routed into 256 partitions by a hash of `event_id`. Links are joined on their own thread at the same time (union-find; the byte-wise smallest ID names the person).
+2. **Dedup (parallel over event_id partitions).** Open-addressing table keeps the copy with the smallest `ingest_ts`; validity of each copy is decided at parse time, so an invalid earliest copy still wins and drops the event. Survivors and clicks are re-routed into 256 partitions by person.
+3. **Sessions (parallel over person partitions).** Sort by (person, ts), split at gaps over 30 min, credit each session to the latest click within 7 days (ties: smallest `click_id`) with a two-pointer sweep, and count assisting campaigns with a sliding window over distinct campaigns. Each worker writes its own `user_daily` Parquet file.
+
+IDs of 1–10 chars from `[0-9A-Z_a-z]` are packed into order-preserving 60-bit integers; anything else is interned, so comparisons stay exact.
+
+## Checks
+
+```sh
+cargo build --release
+python3 scripts/run_fixtures.py fixtures -- target/release/shopping   # 36/36
+DATA_DIR=dev OUTPUT_DIR=out target/release/shopping && python3 scripts/compare.py out dev-answer
+```
+
+`SHOP_PROFILE=1` prints phase timings to stderr.
