@@ -1226,7 +1226,7 @@ static AINLINE bool fast_event(TC& tc, const char* T, const u32* S, u32 nl, char
   } else {
     valid = false;
   }
-  if (UNLIKELY(valid && is_target(uid))) tc.esamp.push_back({uid, eid, (u32)rel, 0});
+  if (UNLIKELY(valid && (u64)rel < (u64)DAYMS && is_target(uid))) tc.esamp.push_back({uid, eid, (u32)rel, 0});
   const u32 p = (u32)(hash64(eid) >> p1sh);
   u32 f = fill[p];
   Ev* d = (Ev*)(wc + (size_t)p * 128 + f);
@@ -1281,7 +1281,7 @@ struct CkTmp {
 };
 // A click goes to the partition of its user ID, as an event does.
 static AINLINE void emit_click(TC& tc, u64 cid, u64 uid, u32 ts, u32 camp) {
-  if (UNLIKELY(is_target(uid))) tc.csamp.push_back({uid, cid, ts, 0});
+  if (UNLIKELY(ts - SEVEN_MS < (u32)DAYMS && is_target(uid))) tc.csamp.push_back({uid, cid, ts, 0});
   Ck r;
   r.uid = uid, r.cid = cid, r.ts = ts, r.camp = camp;
   tc.cks.put((u32)(hash64(uid) >> (64 - g_p2bits)), &r);
@@ -2829,7 +2829,7 @@ int main(int argc, char** argv) {
     vector<std::pair<u32, u64>> top;
     for (auto& [k, c] : cnt) top.push_back({c, k});
     std::sort(top.begin(), top.end(), [](auto& x, auto& y) { return x.first > y.first; });
-    for (size_t i = 0; i < top.size() && g_ntgt < 8 && top[i].first >= 20; i++) {
+    for (size_t i = 0; i < top.size() && g_ntgt < 4 && top[i].first >= 20; i++) {
       g_tgt[g_ntgt++] = top[i].second;
       g_tmask |= 1ull << (hash64(top[i].second) >> 58);
     }
@@ -2962,14 +2962,15 @@ int main(int argc, char** argv) {
     }
     g_nv = ev_bytes / 32 + 1024, g_nw = ck_bytes / 24 + 1024;
     const bool ek = recover_key(ep, ez, 64, 0.75, g_nv, g_ekey);
-    const bool ck = ek && recover_key(cp, cz, 2, 0.75, g_nw, g_ckey);
+    const bool ck = ek && recover_key(cp, cz, 2, 0.5, g_nw, g_ckey);
     g_dense = ek && ck;
     if (g_dense) {
       g_E = (Ev2*)big_alloc(g_nv * sizeof(Ev2));
       g_C = (Ck*)big_alloc(g_nw * sizeof(Ck));
     }
     if (VERBOSE)
-      fprintf(stderr, "[%8.1f ms] dense keys: events %s (%zu pairs) clicks %s (%zu pairs)\n", now_ms(), ek ? "ok" : "no", ep.size(), ck ? "ok" : "no", cp.size());
+      fprintf(stderr, "[%8.1f ms] dense keys: events %s (%zu pairs) clicks %s (%zu pairs)\n", now_ms(), ek ? "ok" : "no", ep.size(), ck ? "ok" : "no", cp.size()), fprintf(stderr, "            samples: %zu events, %zu clicks
+", es.size(), cs.size());
   }
 
   // ---- phase 2: dedup, person, scatter by person
