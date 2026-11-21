@@ -1,0 +1,79 @@
+name: bench
+
+# Linux benchmark: build the real Docker image, run it the way the scorer does
+# (read-only root, no network, uid 1000, CPU/memory limits) on a generated
+# 20M-event dataset, and check correctness on the 36 fixtures.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine
+        run: |
+          nproc; lscpu | grep -E "Model name|Thread|Core|Socket|L2|L3" || true
+          free -g; df -h "$RUNNER_TEMP" | tail -1
+          cat /sys/kernel/mm/transparent_hugepage/enabled || true
+
+      - name: Build generator and native binary
+        run: |
+          cargo build --release --manifest-path tools/gen-lowmem/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+
+      - name: Fixtures (native)
+        run: |
+          pip install --quiet polars
+          python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -3
+
+      - name: Generate data (20M events, seed 42; dev 1M, seed 1)
+        run: |
+          G=tools/gen-lowmem/target/release/generate
+          time $G --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          $G --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" 2>&1 | tail -1
+          du -sh "$RUNNER_TEMP/p20"
+
+      - name: Docker build
+        run: time docker build -t shopping:ci .
+
+      - name: Container runs, scorer flags
+        run: |
+          CPUS=$(nproc)
+          run() {
+            data=$1; out=$(mktemp -d); scratch=$(mktemp -d); chmod 777 "$out" "$scratch"
+            s=$(date +%s.%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+              --cpus "$CPUS" --memory 14g --memory-swap 14g --user 1000:1000 \
+              -v "$data":/data:ro -v "$out":/output -v "$scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+              -e NCPU="$CPUS" -e SHOP_PROFILE=1 shopping:ci 2> "$out.err"
+            code=$?
+            e=$(date +%s.%N)
+            echo "exit=$code wall=$(python3 -c "print(round($e-$s,3))")s :: $(grep -E 's (parse|dedup|relocate|sessions|write)$|cpu' "$out.err" | tr '\n' ' ' | tr -s ' ')"
+            LAST_OUT=$out
+          }
+          echo "== dev"; run "$RUNNER_TEMP/dev"
+          echo "== p20 (first run may be cold cache)"
+          for i in 1 2 3 4 5; do run "$RUNNER_TEMP/p20"; done
+          python3 - "$LAST_OUT" <<'EOF'
+          import sys, glob, polars as pl
+          o = sys.argv[1]
+          u = pl.concat([pl.read_parquet(f) for f in glob.glob(f"{o}/user_daily/*.parquet")])
+          c = pl.concat([pl.read_parquet(f) for f in glob.glob(f"{o}/campaign_daily/*.parquet")])
+          print("user_daily rows", u.height, "sessions", u["sessions"].sum(), "events", u["events"].sum(), "revenue", u["revenue_cents"].sum())
+          print("campaign_daily rows", c.height, "sessions", c["sessions"].sum(), "assisted", c["assisted_sessions"].sum())
+          EOF
+
+      - name: Native runs (same machine, no container)
+        run: |
+          for i in 1 2 3; do
+            out=$(mktemp -d)
+            /usr/bin/time -f "wall=%es user=%Us sys=%Ss maxrss=%MKB" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$out" NCPU=$(nproc) SHOP_PROFILE=1 \
+              ./target/release/shopping 2>&1 | grep -E "wall=|cpu|s (parse|dedup|sessions|write)$" | tr '\n' ' '; echo
+          done
