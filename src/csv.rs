@@ -11,45 +11,35 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
     if n == 0 {
         return false;
     }
+    // Every comma separates fields; a quote may only wrap a whole field.
     let mut f = 0usize;
     let mut start = 0usize;
     loop {
+        let end = match memchr(b',', &line[start..]) {
+            Some(i) => start + i,
+            None => n,
+        };
         if f == N {
             return false;
         }
-        if start < n && line[start] == b'"' {
-            let Some(p) = memchr(b'"', &line[start + 1..]) else {
-                return false;
-            };
-            let close = start + 1 + p;
-            out[f] = &line[start + 1..close];
-            f += 1;
-            if close + 1 == n {
-                break;
-            }
-            if line[close + 1] != b',' {
+        let v = &line[start..end];
+        out[f] = if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+            let inner = &v[1..v.len() - 1];
+            if memchr(b'"', inner).is_some() {
                 return false;
             }
-            start = close + 2;
+            inner
         } else {
-            let mut j = start;
-            while j < n {
-                let b = line[j];
-                if b == b',' {
-                    break;
-                }
-                if b == b'"' {
-                    return false;
-                }
-                j += 1;
+            if memchr(b'"', v).is_some() {
+                return false;
             }
-            out[f] = &line[start..j];
-            f += 1;
-            if j == n {
-                break;
-            }
-            start = j + 1;
+            v
+        };
+        f += 1;
+        if end == n {
+            break;
         }
+        start = end + 1;
     }
     f == N
 }
@@ -68,9 +58,157 @@ pub fn for_lines<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
     }
 }
 
+/// Bitmasks of `\n`, `,` and `"` in the 64 bytes at `p`.
+#[inline(always)]
+fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let cm = _mm256_set1_epi8(b',' as i8);
+        let qt = _mm256_set1_epi8(b'"' as i8);
+        let a = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+        let b = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
+        let m = |x: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, c)) as u32 as u64;
+        (m(a, nl) | m(b, nl) << 32, m(a, cm) | m(b, cm) << 32, m(a, qt) | m(b, qt) << 32)
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nl = _mm_set1_epi8(b'\n' as i8);
+        let cm = _mm_set1_epi8(b',' as i8);
+        let qt = _mm_set1_epi8(b'"' as i8);
+        let (mut mn, mut mc, mut mq) = (0u64, 0u64, 0u64);
+        for i in 0..4 {
+            let v = _mm_loadu_si128(p.as_ptr().add(16 * i) as *const __m128i);
+            let m = |c: __m128i| _mm_movemask_epi8(_mm_cmpeq_epi8(v, c)) as u32 as u64;
+            mn |= m(nl) << (16 * i);
+            mc |= m(cm) << (16 * i);
+            mq |= m(qt) << (16 * i);
+        }
+        (mn, mc, mq)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (mut mn, mut mc, mut mq) = (0u64, 0u64, 0u64);
+        for (i, &b) in p.iter().enumerate() {
+            mn |= ((b == b'\n') as u64) << i;
+            mc |= ((b == b',') as u64) << i;
+            mq |= ((b == b'"') as u64) << i;
+        }
+        (mn, mc, mq)
+    }
+}
+
+/// Call `f` with the `N` unquoted fields of every well-formed line of
+/// `data` (the same dialect as `for_lines` + `split`), in one SIMD pass.
+#[inline(always)]
+pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = data.len();
+    let mut commas = [0usize; N];
+    let mut nc = 0usize; // commas seen in the current line (capped at N)
+    let mut quotes = 0u32; // quotes in the current line
+    let mut line_start = 0usize;
+    let mut tail = [0u8; 64];
+
+    let mut finish = |start: usize, end: usize, commas: &[usize; N], nc: usize, quotes: u32| {
+        if end == start || nc != N - 1 {
+            return;
+        }
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        let mut s = start;
+        for i in 0..N {
+            let e = if i + 1 < N { commas[i] } else { end };
+            out[i] = &data[s..e];
+            s = e + 1;
+        }
+        if quotes != 0 {
+            let mut wrapped = 0u32;
+            for field in out.iter_mut() {
+                let v = *field;
+                if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+                    *field = &v[1..v.len() - 1];
+                    wrapped += 2;
+                }
+            }
+            if wrapped != quotes {
+                return;
+            }
+        }
+        f(&out);
+    };
+
+    let mut base = 0usize;
+    while base < len {
+        let block: &[u8; 64] = if base + 64 <= len {
+            data[base..base + 64].try_into().unwrap()
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&data[base..]);
+            &tail
+        };
+        let (nl, cm, mut qt) = masks(block);
+        let mut seps = nl | cm;
+        while seps != 0 {
+            let bit = seps & seps.wrapping_neg();
+            let pos = base + bit.trailing_zeros() as usize;
+            if nl & bit != 0 {
+                let below = qt & (bit - 1);
+                quotes += below.count_ones();
+                qt &= !below;
+                finish(line_start, pos, &commas, nc, quotes);
+                line_start = pos + 1;
+                nc = 0;
+                quotes = 0;
+            } else {
+                if nc < N {
+                    commas[nc] = pos;
+                }
+                nc += 1;
+                if nc > N {
+                    nc = N;
+                }
+            }
+            seps ^= bit;
+        }
+        quotes += qt.count_ones();
+        base += 64;
+    }
+    if line_start < len {
+        finish(line_start, len, &commas, nc, quotes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `scan` must agree with `for_lines` + `split` on arbitrary input.
+    #[test]
+    fn scan_matches_split() {
+        let alphabet = b"ab,,\"\"\n\r 1";
+        let mut state = 12345u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20000 {
+            let n = (next() % 300) as usize;
+            let data: Vec<u8> = (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let mut a: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_lines(&data, |line| {
+                let mut o = [&b""[..]; 3];
+                if split::<3>(line, &mut o) {
+                    a.push(o.iter().map(|x| x.to_vec()).collect());
+                }
+            });
+            let mut b: Vec<Vec<Vec<u8>>> = Vec::new();
+            scan::<3>(&data, |o| b.push(o.iter().map(|x| x.to_vec()).collect()));
+            assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&data));
+        }
+    }
     fn s<const N: usize>(l: &str) -> Option<Vec<String>> {
         let mut o = [&b""[..]; N];
         split::<N>(l.as_bytes(), &mut o)
@@ -91,5 +229,7 @@ mod tests {
         assert_eq!(s::<1>(""), None);
         assert_eq!(s::<2>(" a,b \r"), Some(vec![" a".into(), "b \r".into()]));
         assert_eq!(s::<2>("\"a,b"), None);
+        assert_eq!(s::<2>("\"a,b\",c"), None);
+        assert_eq!(s::<3>("\"a,b\",c"), None);
     }
 }

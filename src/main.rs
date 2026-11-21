@@ -451,9 +451,8 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-fn parse_event(line: &[u8], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
-    let mut f = [&b""[..]; 7];
-    if !csv::split(line, &mut f) || f[0].is_empty() {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
+    if f[0].is_empty() {
         return;
     }
     let ekey = keys::key(f[0]);
@@ -494,9 +493,8 @@ fn parse_event(line: &[u8], ctx: &Ctx, buckets: &mut [Vec<Ev>]) {
 }
 
 #[inline(always)]
-fn parse_click(line: &[u8], ctx: &Ctx, out: &mut Vec<Cl>) {
-    let mut f = [&b""[..]; 4];
-    if !csv::split(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<Cl>) {
+    if f[0].is_empty() || f[1].is_empty() {
         return;
     }
     let Some(t) = ts::parse(f[3]) else { return };
@@ -936,11 +934,11 @@ fn main() {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice = load_chunk(&event_files[fi], a, b, &mut st.buf);
-                    csv::for_lines(slice, |line| parse_event(line, &ctx, &mut st.ev));
+                    csv::scan::<7>(slice, |f| parse_event(f, &ctx, &mut st.ev));
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice = load_chunk(&click_files[fi], a, b, &mut st.buf);
-                    csv::for_lines(slice, |line| parse_click(line, &ctx, &mut st.cl));
+                    csv::scan::<4>(slice, |f| parse_click(f, &ctx, &mut st.cl));
                 }
             },
         );
