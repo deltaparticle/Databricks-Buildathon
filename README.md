@@ -1,14 +1,19 @@
 # Shopping Sessions
 
-**Shipped pipeline (`cpp/`, built by the Dockerfile):** a C++ pipeline adapted from
+**Shipped pipeline (`lane/`, built by the Dockerfile):** Team 67's
+[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `612962f`),
+used unchanged under its MIT license (copyright notice in `lane/LICENSE`) and the
+organizers' open-reuse policy for this buildathon. All credit for its design and code
+goes to Team 67.
+
+**Previous pipeline (`cpp/`, no longer shipped):** a C++ pipeline adapted from
 [Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)
-(commit `954c08d`; earlier `1fe68bc`, `8452f3a`), reused under the organizers' open-reuse policy for this buildathon.
-All credit for its design goes to its author; our changes on top of it are in this
-repository's history.
+(commit `954c08d`), with our changes on top in this repository's history.
 
 **Reference pipeline (`src/`, Rust):** our own independent implementation of `rules.md`.
-CI diffs the shipped pipeline against it row by row on the 1M dev set and a generated
-20M set on every push, and runs the 36 fixtures against both.
+CI (`.github/workflows/lane.yml`) runs the 36 fixtures and diffs the shipped pipeline
+against it row by row on official-generator data (1M dev set, 20M) and on reshuffled
+20M data. The official generator source is in `tools/generator`.
 
 
 ## Rust reference design

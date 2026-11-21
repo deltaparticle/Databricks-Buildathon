@@ -1,0 +1,95 @@
+name: lane
+
+# Checks the shipped pipeline (lane/, Team 67's MIT-licensed Express Lane):
+# 36 fixtures, exact row-by-row diff against our own Rust reference (src/) on
+# official-generator data (dev 1M seed 1, 20M seed 42) and on reshuffled
+# low-memory-generator data (exercises its fallback), then alternating
+# container runs with scorer flags against a base commit's image.
+on:
+  push:
+    branches: [main]
+    paths: [lane/**, Dockerfile, .github/workflows/lane.yml]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit whose Dockerfile image to time against"
+        required: false
+        default: 1bacb58
+
+permissions:
+  contents: read
+
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Machine (the build targets Cascade Lake, so AVX-512 is required)
+        run: |
+          nproc; lscpu | grep "Model name"; free -g
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512vnni; do
+            grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
+          done
+
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          cargo build --release -q --manifest-path tools/gen-lowmem/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          (cd lane && cargo build --release -q)
+          cp lane/target/release/pipeline lanebin
+          pip install --quiet polars
+
+      - name: Fixtures
+        run: |
+          echo "lane:"; python3 scripts/run_fixtures.py fixtures -- "$PWD/lanebin" | tail -2
+          echo "reference:"; python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -1
+
+      - name: Data
+        run: |
+          G=tools/generator/target/release/generate
+          $G --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" 2>&1 | tail -1
+          $G --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          tools/gen-lowmem/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/s20" 2>&1 | tail -1
+          du -sh "$RUNNER_TEMP"/dev "$RUNNER_TEMP"/p20 "$RUNNER_TEMP"/s20
+
+      - name: Exact diff against the Rust reference
+        run: |
+          for d in dev p20 s20; do
+            a=$(mktemp -d); b=$(mktemp -d)
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a" NCPU=$(nproc) ./lanebin
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
+            echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+          done
+
+      - name: Container A/B, scorer flags (alternating, same machine)
+        run: |
+          BASE="${{ github.event.inputs.base }}"; BASE=${BASE:-1bacb58}
+          docker build -q -t cur . >/dev/null
+          git worktree add -q /tmp/base "$BASE"
+          docker build -q -t base /tmp/base >/dev/null
+          echo "cur = $(git rev-parse --short HEAD)   base = $BASE"
+          run() {
+            out=$(mktemp -d); chmod 777 "$out"
+            s=$(date +%s.%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+              --cpus "$(nproc)" --memory 14g --memory-swap 14g --user 1000:1000 \
+              -v "$2":/data:ro -v "$out":/output -e NCPU="$(nproc)" "$1" > /dev/null 2>&1
+            code=$?; e=$(date +%s.%N)
+            echo "$1 exit=$code wall=$(python3 -c "print(round($e-$s,3))")" | tee -a ab.txt
+            eval "LAST_$1=$out"
+          }
+          for i in 1 2 3 4 5 6; do run cur "$RUNNER_TEMP/p20"; run base "$RUNNER_TEMP/p20"; done
+          echo "container output, cur vs base: $(cd scripts && python3 compare.py "$LAST_cur" "$LAST_base" | tail -1)"
+          python3 - <<'PY'
+          import statistics as st
+          rows = [l.split() for l in open("ab.txt")]
+          for img in ("cur", "base"):
+              w = [float(r[2][5:]) for r in rows if r[0] == img and r[1] == "exit=0"]
+              print(f"{img}: median wall {st.median(w):.3f}s n={len(w)}" if w else f"{img}: no successful runs")
+          PY
