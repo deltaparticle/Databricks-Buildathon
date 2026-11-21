@@ -1,9 +1,9 @@
 //! Exact 64-bit keys for ID strings.
 //!
-//! A string of 1 to 10 bytes from `[0-9A-Z_a-z]` packs into 60 bits, 6 bits
-//! per byte, big-endian, padded with code 0. Codes keep ASCII order and the pad
-//! sorts below every character, so packed keys compare exactly like the
-//! strings do, byte by byte. Every other non-empty string is interned and gets
+//! A string of 1 to 9 ASCII bytes with no NUL packs into 63 bits: 7 bits per
+//! byte, big-endian, padded with 0. ASCII order is kept and the pad sorts
+//! below every byte, so packed keys compare exactly like the strings do, byte
+//! by byte. Every other non-empty string is interned and gets
 //! `FALLBACK | index`; comparisons involving one go through the bytes.
 
 use std::cmp::Ordering;
@@ -12,53 +12,34 @@ use std::sync::{Mutex, RwLock};
 
 pub const FALLBACK: u64 = 1 << 63;
 
-const fn code_table() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut c = 0u8;
-    let mut i = 0;
-    while i < 256 {
-        let b = i as u8;
-        if b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'_' || b.is_ascii_lowercase() {
-            c += 1;
-            t[i] = c;
-        }
-        i += 1;
-    }
-    t
-}
-static CODE: [u8; 256] = code_table();
-
-const fn decode_table() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let mut i = 0;
-    while i < 256 {
-        let c = code_table()[i];
-        if c != 0 {
-            t[c as usize] = i as u8;
-        }
-        i += 1;
-    }
-    t
-}
-static DECODE: [u8; 64] = decode_table();
-
+/// Pack up to 9 ASCII bytes (no NUL), or None. Branch-light SWAR.
 #[inline(always)]
 pub fn pack(s: &[u8]) -> Option<u64> {
     let n = s.len();
-    if n == 0 || n > 10 {
+    if n == 0 || n > 9 {
         return None;
     }
-    let mut k = 0u64;
-    let mut ok = 0xffu8;
-    for &b in s {
-        let c = CODE[b as usize];
-        ok &= if c == 0 { 0 } else { 0xff };
-        k = (k << 6) | c as u64;
-    }
-    if ok == 0 {
+    let mut b = [0u8; 16];
+    b[..n].copy_from_slice(s);
+    let hi = u64::from_be_bytes(b[..8].try_into().unwrap());
+    let lo = b[8] as u64;
+    // ASCII only.
+    if (hi | lo) & 0x8080_8080_8080_8080 != 0 {
         return None;
     }
-    Some(k << (6 * (10 - n)))
+    // No NUL inside the string: make the padding bytes non-zero, then test
+    // for any zero byte (exact for presence).
+    let pad = if n >= 8 { 0 } else { u64::MAX >> (8 * n) };
+    let v = hi | pad;
+    if (v.wrapping_sub(0x0101_0101_0101_0101) & !v & 0x8080_8080_8080_8080) != 0 || (n == 9 && lo == 0) {
+        return None;
+    }
+    // Squeeze eight 7-bit bytes into 56 bits, keeping their order.
+    let mut x = hi;
+    x = (x & 0x007F_007F_007F_007F) | ((x & 0x7F00_7F00_7F00_7F00) >> 1);
+    x = (x & 0x0000_3FFF_0000_3FFF) | ((x & 0x3FFF_0000_3FFF_0000) >> 2);
+    x = (x & 0x0000_0000_0FFF_FFFF) | ((x & 0x0FFF_FFFF_0000_0000) >> 4);
+    Some(x << 7 | lo)
 }
 
 struct Table {
@@ -98,16 +79,14 @@ pub fn bytes(k: u64, out: &mut Vec<u8>) {
         out.extend_from_slice(&FROZEN.read().unwrap()[(k & !FALLBACK) as usize]);
         return;
     }
-    let mut v = k;
-    let mut buf = [0u8; 10];
+    let mut buf = [0u8; 9];
     let mut n = 0;
-    for i in 0..10 {
-        let c = (v >> 54) as usize & 63;
-        v <<= 6;
+    for i in 0..9 {
+        let c = ((k >> (7 * (8 - i))) & 0x7F) as u8;
         if c == 0 {
             break;
         }
-        buf[i] = DECODE[c];
+        buf[i] = c;
         n += 1;
     }
     out.extend_from_slice(&buf[..n]);
@@ -138,6 +117,8 @@ mod tests {
         let words: Vec<&[u8]> = vec![
             b"u1", b"U1", b"u", b"uz", b"u10", b"_", b"a", b"0", b"zzzzzzzzzz", b" u1", b"u1 ",
             b"u1\r", b"abcdefghijk", b"user_id_a", b"user_id_b\t", b"p\xc3\xa9",
+            b"uzzzzzzzz", b"u00000000", b"u0000000", b"e~~~~~~~~", b"\x7f", b"a\x00b", b"\x00",
+            b"ab\x00", b"123456789", b"1234567890", b"U1ABCDEFG", b" ", b"  ",
         ];
         for a in &words {
             let mut out = Vec::new();

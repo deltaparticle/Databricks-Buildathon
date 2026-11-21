@@ -164,7 +164,7 @@ fn civil19_ref(s: &[u8]) -> Option<i64> {
 }
 
 /// Epoch milliseconds, `HUGE` for an F3 value beyond i64, or None if bad.
-#[inline]
+#[inline(always)]
 pub fn parse(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 20 && s[19] == b'Z' {
@@ -201,7 +201,7 @@ fn digits8(w: u64) -> Option<u64> {
     Some(v)
 }
 
-#[inline]
+#[inline(always)]
 fn parse_f3(s: &[u8]) -> Option<i64> {
     if s.len() == 13 {
         if let Some(hi) = digits8(le8(s, 0)) {
