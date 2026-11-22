@@ -9,6 +9,14 @@ publish = false
 name = "pipeline"
 path = "src/main.rs"
 
+[features]
+stats = []
+knobs = []
+testkeys = []
+pmu = []
+tl = []
+sp = []
+
 [dependencies]
 
 [profile.release]
@@ -17,6 +25,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(pgo_gen)"] }

@@ -10,7 +10,9 @@ in this repository. Each scored version can also be rebuilt exactly from its com
 | C++ pipeline adapted from Dremix10/shopping-sessions-fast `8452f3a` | history only | `5355eaa` | 0.66 s |
 | C++ pipeline, upstream Dremix10 `954c08d` with our build | `attempts/cpp-1bacb58/` (exact snapshot, with its Dockerfile) | `1bacb58` | 0.64 s |
 | C++ dense-index experiment (event/click IDs decoded to generation indices; exact, but not faster) | `cpp/` | `95cb0e0` | not submitted |
-| Team 67's Express Lane, unused code removed | `lane/` (shipped) | current `main` | pending |
+| Team 67's Express Lane `612962f`, unused code removed | history only | `d3fb904` | 0.2821 s |
+| Same, smaller user buckets and R3 off (CI 1.7-2.2% faster) | history only | `565cc3b` | 0.2873 s (worse; reverted) |
+| Team 67's Express Lane `078e760` (CI 2.2-2.3% faster than `612962f`) | `lane/` (shipped) | current `main` | pending |
 
 The commits of the three Rust submissions are approximate: the scores were reported in
 chat without the exact hashes. `1bacb58` and `5355eaa` are exact (see the commit

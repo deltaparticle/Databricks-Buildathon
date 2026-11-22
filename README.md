@@ -1,15 +1,13 @@
 # Shopping Sessions
 
 **Shipped pipeline (`lane/`, built by the Dockerfile):** Team 67's
-[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `612962f`),
-used under its MIT license (copyright notice in `lane/LICENSE`) and the organizers'
-open-reuse policy for this buildathon. All credit for its design and code goes to
-Team 67. Our changes: code the shipped build never compiles or calls is removed (the
-`stats`, `knobs`, `testkeys`, `pmu` and `tl` feature-gated code, 75 unused functions,
-types and constants, and an unused Parquet write method), about 1,250 lines. The
-machine code of the shipped binary is otherwise unchanged (checked function by function
-with `tools/asmcmp.py`), and CI checks the output row by row against the unmodified
-build.
+[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `078e760`),
+used unchanged under its MIT license (copyright notice in `lane/LICENSE`) and the
+organizers' open-reuse policy for this buildathon. All credit for its design and code
+goes to Team 67. CI checks its output row by row against our own Rust reference and
+times it against earlier versions (30 interleaved rounds on three machines: 2.2-2.3%
+faster than `612962f`). Our earlier cleanup of `612962f` (unused code removed, machine
+code verified unchanged with `tools/asmcmp.py`) is in history at `d3fb904`.
 
 **Earlier attempts:** see [`attempts/`](attempts/README.md). Our C++ dense-index
 experiment is in `cpp/` (adapted from
