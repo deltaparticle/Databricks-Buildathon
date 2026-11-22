@@ -42,7 +42,7 @@ jobs:
         run: |
           tools/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" > /dev/null 2>&1
           o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$o" NCPU=$(nproc) ./ownbin
-          echo "dev vs official answer: $(cd scripts && python3 compare.py "$o" ../tools/dev-answer | tail -1)"
+          (cd scripts && python3 compare.py "$o" ../tools/dev-answer | tail -16) || true
       - name: 20M data and exact cross-check
         run: |
           tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
@@ -63,7 +63,7 @@ jobs:
           a=$(mktemp -d); b=$(mktemp -d)
           /usr/bin/time -f "exact wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) SHOP_EXACT_LONG=1 ./ownbin
           DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$b" NCPU=$(nproc) ./ownbin
-          echo "fast vs exact mode: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+          (cd scripts && python3 compare.py "$a" "$b" | tail -16) || true
       - name: Container timing
         run: |
           docker build -q -t cur . > /dev/null
