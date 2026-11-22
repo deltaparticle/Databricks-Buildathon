@@ -78,13 +78,14 @@ jobs:
           b bin-base2 $M ""
           b relocs $M "$R"
           b grelocs $G "$R"
-          # PIE does not link (the hand asm uses absolute R_X86_64_32S addressing). Hypothesis for the
-          # BOLT relocation-mode crashes: absolute (static-model) jump tables BOLT does not detect.
-          # So: builds without jump tables.
-          NJ="-C llvm-args=-min-jump-table-entries=100000"
-          b nojt $M "$R $NJ"; cp nojt bin-nojt
-          b gnojt $G "$R $NJ"; cp gnojt bin-gnojt
-          b gnojtinst $G "$R $NJ --cfg bolt_instr"
+          # PIE does not link (the hand asm uses absolute R_X86_64_32S addressing). Jump tables were not
+          # the cause of BOLT's relocation-mode crash (crash site: "cs (bad)" inside old main). Next
+          # hypothesis: the assembler's JCC-erratum prefix padding (cs prefixes). Builds without it:
+          PL="-C target-cpu=cascadelake -C relocation-model=static $R"
+          (cd lane && RUSTFLAGS="$PL" CARGO_TARGET_DIR=/tmp/t-pj cargo build --release -q --target $M) && cp /tmp/t-pj/$M/release/pipeline ./pj
+          (cd lane && RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static" CARGO_TARGET_DIR=/tmp/t-nojcc cargo build --release -q --target $M) && cp /tmp/t-nojcc/$M/release/pipeline ./bin-nojcc
+          (cd lane && RUSTFLAGS="$PL" CARGO_TARGET_DIR=/tmp/t-gpj cargo build --release -q --target $G) && cp /tmp/t-gpj/$G/release/pipeline ./gpj && cp gpj bin-gpj
+          (cd lane && RUSTFLAGS="$PL --cfg bolt_instr" CARGO_TARGET_DIR=/tmp/t-gpji cargo build --release -q --target $G) && cp /tmp/t-gpji/$G/release/pipeline ./gpjinst
           cp grelocs bin-gdyn
           ls -l bin-* relocs grelocs
       - name: BOLT
@@ -115,24 +116,25 @@ jobs:
             [ -x ./$o ] && echo "== bolt $o ok" || echo "== bolt $o FAILED"
           }
           STD="-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -icf=all -use-gnu-stack -dyno-stats"
-          agg ./nojt nprof.fdata
+          agg ./pj jprof.fdata
+          JCC="-x86-align-branch-boundary-hot-only -x86-branches-within-32B-boundaries"
           bo bin-bolt_nr ./relocs prof.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
-          bo bin-bolt_jt ./relocs prof.fdata $STD -jump-tables=none
-          bo bin-nbolt ./nojt nprof.fdata $STD
-          bo bin-nbolt_b ./nojt nprof.fdata -reorder-blocks=ext-tsp -reorder-functions=cdsort -use-gnu-stack
-          bo bin-nbolt_nr ./nojt nprof.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
-          # exact edge counts: instrument the glibc no-jump-table build, dump at exit()
-          $BOLT ./gnojtinst -instrument -instrumentation-file=$PWD/inst.fdata -o ./ginst 2>&1 | grep -E "BOLT-(ERROR)" | tail -4
+          bo bin-jbolt ./pj jprof.fdata $STD
+          bo bin-jbolt_b ./pj jprof.fdata -reorder-blocks=ext-tsp -reorder-functions=cdsort -use-gnu-stack
+          bo bin-jbolt_c ./pj jprof.fdata $STD $JCC
+          bo bin-jbolt_nr ./pj jprof.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
+          # exact edge counts: instrument the glibc no-padding build, dump at exit()
+          $BOLT ./gpjinst -instrument -instrumentation-file=$PWD/inst.fdata -o ./ginst 2>&1 | grep -E "BOLT-(ERROR)" | tail -4
           DATA_DIR="$RUNNER_TEMP/t20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./ginst >/dev/null 2>ginst.err; echo "instrumented run exit=$?"; tail -3 ginst.err; ls -l inst.fdata
           if [ -s inst.fdata ]; then
-            bo bin-gnbolt_i ./gnojt inst.fdata $STD
-            bo bin-gnbolt_ib ./gnojt inst.fdata -reorder-blocks=ext-tsp -reorder-functions=cdsort -use-gnu-stack
-            bo bin-gnbolt_inr ./gnojt inst.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
-            bo bin-nbolt_i ./nojt inst.fdata $STD -infer-stale-profile
+            bo bin-gjbolt_i ./gpj inst.fdata $STD
+            bo bin-gjbolt_ic ./gpj inst.fdata $STD $JCC
+            bo bin-gjbolt_inr ./gpj inst.fdata -relocs=0 -reorder-blocks=ext-tsp -use-gnu-stack
+            bo bin-jbolt_i ./pj inst.fdata $STD $JCC -infer-stale-profile
           fi
           ls -l bin-*
           # where do the bolted binaries crash?
-          for f in bin-nbolt ginst; do [ -x $f ] || continue
+          for f in bin-jbolt ginst; do [ -x $f ] || continue
             echo "== gdb $f"
             DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) timeout 120 gdb -q -batch -ex run -ex bt -ex 'info symbol $pc' -ex 'x/4i $pc' ./$f 2>&1 | grep -E "SIGSEGV|SIGILL|SIGBUS|^#[0-9]|=>|exited|in section" | head -12 || true
           done
