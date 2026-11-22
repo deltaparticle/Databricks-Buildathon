@@ -1,6 +1,6 @@
 # Shopping Sessions: one statically linked Rust binary in an empty image.
 # The pipeline in lane/ is Team 67's MIT-licensed Express Lane
-# (github.com/jason-scheffel/express-lane, commit 078e760), used unchanged;
+# (github.com/jason-scheffel/express-lane, commit 3493fdd), used unchanged;
 # see lane/LICENSE and README. The scorer builds this natively for
 # linux/amd64 and runs CMD as uid 1000 with a read-only root, no network,
 # /data read-only, /output writable.

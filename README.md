@@ -1,7 +1,7 @@
 # Shopping Sessions
 
 **Shipped pipeline (`lane/`, built by the Dockerfile):** Team 67's
-[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `078e760`),
+[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `3493fdd`),
 used unchanged under its MIT license (copyright notice in `lane/LICENSE`) and the
 organizers' open-reuse policy for this buildathon. All credit for its design and code
 goes to Team 67. CI checks its output row by row against our own Rust reference and
