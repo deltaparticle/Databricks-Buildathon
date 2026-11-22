@@ -1,0 +1,67 @@
+name: t67sweep
+
+# Runtime-knob sweep of a mirrored Team 67 Express Lane branch on v5 20M data:
+# exact check of each variant against the default run, then interleaved timing.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch holding the mirrored Express Lane tree"
+        required: true
+        default: "exp/t67-c4a033b"
+      variants:
+        description: "Semicolon-separated label=ENV=VAL [ENV=VAL...] runtime variants"
+        required: true
+      rounds:
+        required: false
+        default: "12"
+      parts:
+        required: false
+        default: '["a", "b"]'
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(github.event.inputs.parts) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Machine
+        run: |
+          nproc; lscpu | grep "Model name"
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
+            grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
+          done
+          echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          git worktree add -q /tmp/t67 "origin/${{ github.event.inputs.ref }}"
+          (cd /tmp/t67 && cargo build --release -q) && cp /tmp/t67/target/release/pipeline ./t67bin
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+      - name: Variants
+        env:
+          VARIANTS: ${{ github.event.inputs.variants }}
+        run: |
+          pip install --quiet polars
+          echo "base ./t67bin" > v.txt; echo "base2 ./t67bin" >> v.txt
+          ref=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$ref" NCPU=$(nproc) ./t67bin
+          printf '%s\n' "$VARIANTS" | tr ';' '\n' > specs.txt
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            label=${spec%%=*}; assigns=${spec#*=}
+            o=$(mktemp -d); env $assigns DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./t67bin
+            echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
+            echo "$label ./t67bin $assigns" >> v.txt
+          done < specs.txt
+          cat v.txt
+      - name: Sweep
+        run: python3 tools/sweep.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds }} v.txt
