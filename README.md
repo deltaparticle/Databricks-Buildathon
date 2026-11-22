@@ -1,26 +1,25 @@
 # Shopping Sessions
 
-**Shipped pipeline (`lane/`, built by the Dockerfile):** Team 67's
-[Express Lane](https://github.com/jason-scheffel/express-lane) (commit `2d7801e`),
-used unchanged under its MIT license (copyright notice in `lane/LICENSE`) and the
-organizers' open-reuse policy for this buildathon. All credit for its design and code
-goes to Team 67. CI checks its output row by row against our own Rust reference and
-times it against earlier versions (30 interleaved rounds on three machines: 2.2-2.3%
-faster than `612962f`). Our earlier cleanup of `612962f` (unused code removed, machine
-code verified unchanged with `tools/asmcmp.py`) is in history at `d3fb904`.
+**Shipped pipeline (`src/`, Rust, built by the root Dockerfile):** our own independent
+implementation of `rules.md`, written by our team. It parses every CSV with a SIMD line
+scanner, deduplicates events by exact ID, joins linked IDs with union-find, sessionizes
+per person and writes both Parquet tables with a hand-written writer. IDs are treated as
+opaque byte strings (short ones packed into integers, long ones interned), as scorer v5
+requires.
 
-**Earlier attempts:** see [`attempts/`](attempts/README.md). Our C++ dense-index
-experiment is in `cpp/` (adapted from
-[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast)),
-the 0.64 s submission in `attempts/cpp-1bacb58/`.
+CI (`.github/workflows/own.yml`) runs the 36 fixtures, the official v5 dev answer
+(`tools/dev-answer/`), an exact 20M cross-check, phase timings and container timing. The
+official v5 generator source is in `tools/generator`.
 
-**Reference pipeline (`src/`, Rust):** our own independent implementation of `rules.md`.
-CI (`.github/workflows/lane.yml`) runs the 36 fixtures and diffs the shipped pipeline
-against it row by row on official-generator data (1M dev set, 20M) and on reshuffled
-20M data. The official generator source is in `tools/generator`.
+**History:** earlier submissions used other engines (an adaptation of
+[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast) and
+Team 67's MIT [Express Lane](https://github.com/jason-scheffel/express-lane)). After the
+organizers' rule that entries must be the team's own work, main ships only our own code;
+that earlier work, with its credits, is kept on the `archive/pre-v5` branch. See
+[`attempts/`](attempts/README.md).
 
 
-## Rust reference design
+## Design
 
 1. **Parse (parallel).** Every CSV is memory-mapped and cut into ~4 MB newline-aligned chunks (the dialect never puts a newline inside a value, so any `\n` is a safe cut). Worker threads parse events and clicks; events are routed into 256 partitions by a hash of `event_id`. Links are joined on their own thread at the same time (union-find; the byte-wise smallest ID names the person).
 2. **Dedup (parallel over event_id partitions).** Open-addressing table keeps the copy with the smallest `ingest_ts`; validity of each copy is decided at parse time, so an invalid earliest copy still wins and drops the event. Survivors and clicks are re-routed into 256 partitions by person.

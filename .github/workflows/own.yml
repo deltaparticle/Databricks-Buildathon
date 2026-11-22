@@ -1,0 +1,81 @@
+name: own
+
+# Checks for our own Rust pipeline (src/, shipped by the root Dockerfile) on
+# scorer v5 data (opaque variable-width IDs): 36 fixtures, the official v5 dev
+# answer, an exact cross-check at 20M against an independent implementation
+# (archive/pre-v5's general path, used only as a test oracle), phase timings,
+# and container timing against a base commit.
+on:
+  push:
+    branches: [main]
+    paths: [src/**, Cargo.toml, Cargo.lock, Dockerfile, .github/workflows/own.yml]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Commit whose root Dockerfile image to time against (empty = none)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  own:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Machine
+        run: nproc; lscpu | grep "Model name"; free -g
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          cp target/release/shopping ownbin
+          pip install --quiet polars
+      - name: Fixtures
+        run: python3 scripts/run_fixtures.py fixtures -- "$PWD/ownbin" | tail -2
+      - name: Official v5 dev answer
+        run: |
+          tools/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" > /dev/null 2>&1
+          o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$o" NCPU=$(nproc) ./ownbin
+          echo "dev vs official answer: $(cd scripts && python3 compare.py "$o" ../tools/dev-answer | tail -1)"
+      - name: 20M data and exact cross-check
+        run: |
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          du -sh "$RUNNER_TEMP/p20"
+          # independent oracle: the general (non-generator-aware) engine on archive/pre-v5, test use only
+          if git worktree add -q /tmp/oracle origin/archive/pre-v5 2>/dev/null && grep -qw avx512bw /proc/cpuinfo; then
+            (cd /tmp/oracle/lane && cargo build --release -q) && a=$(mktemp -d) && b=$(mktemp -d) \
+              && DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$a" NCPU=$(nproc) ./ownbin \
+              && /tmp/oracle/lane/target/release/pipeline --generic "$RUNNER_TEMP/p20" "$b" \
+              && echo "p20 vs oracle: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+          else echo "oracle skipped (no AVX-512 on this runner)"; fi
+      - name: Phase timings (native)
+        run: |
+          for i in 1 2 3; do
+            /usr/bin/time -f "wall=%e user=%U sys=%S maxrss=%MKB" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./ownbin 2>&1 | tail -12
+          done
+      - name: Container timing
+        run: |
+          docker build -q -t cur . > /dev/null
+          imgs="cur"
+          if [ -n "${{ github.event.inputs.base }}" ]; then
+            git worktree add -q /tmp/base "${{ github.event.inputs.base }}" && docker build -q -t base /tmp/base > /dev/null && imgs="cur base"
+          fi
+          run() {
+            out=$(mktemp -d); chmod 777 "$out"; s=$(date +%s.%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --pids-limit 4096 --cpus "$(nproc)" --memory 14g --memory-swap 14g \
+              --user 1000:1000 -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" "$1" > /dev/null 2>&1
+            echo "$1 $? $(python3 -c "print(round($(date +%s.%N)-$s,4))")" >> t.txt
+          }
+          for i in $(seq 8); do for img in $imgs; do run $img; done; done
+          python3 -c "
+          import statistics as st
+          rows=[l.split() for l in open('t.txt')]
+          for img in '$imgs'.split():
+              w=[float(r[2]) for r in rows if r[0]==img and r[1]=='0']
+              print(img, 'container median', round(st.median(w),4) if w else 'FAILED', 'n=', len(w))"

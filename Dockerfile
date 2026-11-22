@@ -1,20 +1,18 @@
 # Shopping Sessions: one statically linked Rust binary in an empty image.
-# The pipeline in lane/ is Team 67's MIT-licensed Express Lane
-# (github.com/jason-scheffel/express-lane, commit 2d7801e), used unchanged;
-# see lane/LICENSE and README. The scorer builds this natively for
-# linux/amd64 and runs CMD as uid 1000 with a read-only root, no network,
-# /data read-only, /output writable.
-FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev
+# The scorer builds this natively for linux/amd64 and runs CMD as uid 1000
+# with a read-only root, no network, /data read-only and /output writable.
+FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY lane/Cargo.toml lane/Cargo.lock ./
-COPY lane/.cargo .cargo
-COPY lane/src src
-RUN cargo build --release --target x86_64-unknown-linux-musl \
- && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# Scorers are Intel Xeon (Cascade Lake or newer): AVX2/BMI2 are always there.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
+ && strip target/x86_64-unknown-linux-gnu/release/shopping \
+ && cp target/x86_64-unknown-linux-gnu/release/shopping /shopping
 
 FROM scratch
-COPY --from=build /pipeline /pipeline
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8
+COPY --from=build /shopping /shopping
+ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 USER 1000:1000
-CMD ["/pipeline"]
+CMD ["/shopping"]
