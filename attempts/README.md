@@ -13,7 +13,8 @@ in this repository. Each scored version can also be rebuilt exactly from its com
 | Team 67's Express Lane `612962f`, unused code removed | history only | `d3fb904` | 0.2821 s |
 | Same, smaller user buckets and R3 off (CI 1.7-2.2% faster) | history only | `565cc3b` | 0.2873 s (worse; reverted) |
 | Team 67's Express Lane `078e760` (CI 2.2-2.3% faster than `612962f`) | history only | `8e6fe53` | not submitted |
-| Team 67's Express Lane `3493fdd` (same speed as `078e760`, plus two parse fixes) | `lane/` (shipped) | current `main` | pending |
+| Team 67's Express Lane `3493fdd` (same speed as `078e760`, plus two parse fixes) | history only | `075022a` | not submitted |
+| Team 67's Express Lane `2d7801e` (container -0.8% to -2.2% vs `3493fdd`) | `lane/` (shipped) | current `main` | pending |
 
 The commits of the three Rust submissions are approximate: the scores were reported in
 chat without the exact hashes. `1bacb58` and `5355eaa` are exact (see the commit
