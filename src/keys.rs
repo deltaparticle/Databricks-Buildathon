@@ -40,9 +40,14 @@ pub fn raw(s: &[u8], pfx: u8) -> Option<u64> {
     if !(2..=9).contains(&n) || s[0] != pfx {
         return None;
     }
-    let mut b = [0u8; 8];
-    b[..n - 1].copy_from_slice(&s[1..]);
-    let v = u64::from_le_bytes(b);
+    let v = if n == 9 {
+        // the usual case (letter + 8 characters): one 8-byte load
+        u64::from_le_bytes(s[1..9].try_into().unwrap())
+    } else {
+        let mut b = [0u8; 8];
+        b[..n - 1].copy_from_slice(&s[1..]);
+        u64::from_le_bytes(b)
+    };
     if has_zero(v, n - 1) {
         return None;
     }
@@ -114,7 +119,7 @@ thread_local! {
 }
 
 /// Sorted unique long values, filled by `verify_longs`.
-static LONGS: RwLock<Vec<u128>> = RwLock::new(Vec::new());
+static LONGS: std::sync::OnceLock<Vec<u128>> = std::sync::OnceLock::new();
 static VERIFIED: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
@@ -190,7 +195,7 @@ pub fn verify_longs(threads: usize) -> bool {
     for c in cells {
         table.extend(c.0.into_inner());
     }
-    *LONGS.write().unwrap() = table;
+    let _ = LONGS.set(table);
     VERIFIED.store(true, AO::Relaxed);
     !NEED_EXACT.load(AO::Relaxed)
 }
@@ -302,7 +307,7 @@ fn hex_value(k: u64) -> Option<u128> {
         return None;
     }
     let top = (k & !HEX_TAG) >> 8;
-    let t = LONGS.read().unwrap();
+    let Some(t) = LONGS.get() else { return None };
     let i = t.partition_point(|&v| ((v >> 73) as u64) < top);
     (i < t.len() && (t[i] >> 73) as u64 == top).then(|| t[i])
 }
