@@ -40,20 +40,23 @@ jobs:
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
           tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
       - name: Build variants
+        env:
+          VARIANTS: ${{ github.event.inputs.variants }}
         run: |
           pip install --quiet polars
           RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=/tmp/t-base cargo build --release -q && cp /tmp/t-base/release/shopping bin-base
           echo "base ./bin-base" > v.txt; echo "base2 ./bin-base" >> v.txt
           ref=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$ref" NCPU=$(nproc) ./bin-base
-          IFS=';'; for spec in ${{ github.event.inputs.variants }}; do
-            unset IFS
+          printf '%s' "$VARIANTS" | tr ';' '\n' > specs.txt
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
             label=${spec%%=*}; assigns=${spec#*=}
-            (eval "export $assigns; CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q") && cp /tmp/t-$label/release/shopping bin-$label || { echo "build $label failed"; continue; }
-            o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./bin-$label
-            echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
-            echo "$label ./bin-$label" >> v.txt
-            IFS=';'
-          done
-          unset IFS; cat v.txt
+            if (eval "export $assigns; CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q") && cp /tmp/t-$label/release/shopping bin-$label; then
+              o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./bin-$label
+              echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
+              echo "$label ./bin-$label" >> v.txt
+            else echo "build $label failed"; fi
+          done < specs.txt
+          cat v.txt
       - name: Sweep
         run: python3 tools/sweep.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds }} v.txt
