@@ -1004,6 +1004,9 @@ fn write_user(path: &Path, r: UserRows) {
 fn main() {
     let t0 = Instant::now();
     let _ = T0.set(t0);
+    if std::env::var_os("SHOP_NOTABLE").is_some() {
+        keys::NOTABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
     let lap = |what: &str| {
         if profile {

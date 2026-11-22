@@ -59,6 +59,10 @@ jobs:
           for i in 1 2 3; do
             /usr/bin/time -f "wall=%e user=%U sys=%S maxrss=%MKB" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 ./ownbin 2>&1 | tail -12
           done
+          echo "== measurement: long-ID table skipped (SHOP_NOTABLE=1)"
+          for i in 1 2; do
+            /usr/bin/time -f "notable wall=%e user=%U sys=%S" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) SHOP_PROFILE=1 SHOP_NOTABLE=1 ./ownbin 2>&1 | tail -12
+          done
       - name: Container timing
         run: |
           docker build -q -t cur . > /dev/null

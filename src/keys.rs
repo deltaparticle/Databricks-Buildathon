@@ -67,6 +67,10 @@ pub fn key(s: &[u8], pfx: u8) -> u64 {
         None => {
             if s.len() == 33 && s[0] == pfx {
                 if let Some(v) = hex128(&s[1..]) {
+                    if NOTABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                        // measurement only (SHOP_NOTABLE=1): key by the top 55 bits, no table
+                        return HEX_TAG | ((v >> 73) as u64) << 8;
+                    }
                     return intern_hex(v);
                 }
             }
@@ -85,6 +89,10 @@ pub fn key(s: &[u8], pfx: u8) -> u64 {
 // because fixed-width lowercase hex sorts like the value.
 
 const HEX_TAG: u64 = 1 << 63;
+
+/// Measurement switch (SHOP_NOTABLE=1): skip the long-ID table to see its cost.
+/// Output is not guaranteed exact with it on; never set in production.
+pub static NOTABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const HEX_SHARDS: usize = 256;
 
 #[derive(Default)]
