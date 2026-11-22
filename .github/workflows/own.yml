@@ -69,7 +69,12 @@ jobs:
           (cd scripts && python3 compare.py "$a" "$b" | tail -16) || true
       - name: Container timing
         run: |
-          docker build -q -t cur . > /dev/null
+          docker build --progress=plain -t cur . 2>&1 | grep -E "PGO build|plain build|ERROR|error:" || true
+          # the image (profile-guided, Cascade Lake) must give the same output as the plain build
+          o=$(mktemp -d); chmod 777 "$o"
+          docker run --rm --user 1000:1000 -v "$RUNNER_TEMP/p20":/data:ro -v "$o":/output -e NCPU="$(nproc)" cur
+          r=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$r" NCPU=$(nproc) ./ownbin
+          echo "image vs plain build: $(cd scripts && python3 compare.py "$o" "$r" | tail -1)"
           imgs="cur"
           if [ -n "${{ github.event.inputs.base }}" ]; then
             git worktree add -q /tmp/base "${{ github.event.inputs.base }}" && docker build -q -t base /tmp/base > /dev/null && imgs="cur base"
