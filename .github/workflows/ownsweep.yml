@@ -15,6 +15,9 @@ on:
       parts:
         required: false
         default: '["a", "b"]'
+      base_flags:
+        required: false
+        default: "-C target-cpu=cascadelake"
 
 permissions:
   contents: read
@@ -44,14 +47,22 @@ jobs:
           VARIANTS: ${{ github.event.inputs.variants }}
         run: |
           pip install --quiet polars
-          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=/tmp/t-base cargo build --release -q && cp /tmp/t-base/release/shopping bin-base
+          BF="${{ github.event.inputs.base_flags }}"
+          RUSTFLAGS="$BF" CARGO_TARGET_DIR=/tmp/t-base cargo build --release -q && cp /tmp/t-base/release/shopping bin-base
           echo "base ./bin-base" > v.txt; echo "base2 ./bin-base" >> v.txt
           ref=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$ref" NCPU=$(nproc) ./bin-base
-          printf '%s' "$VARIANTS" | tr ';' '\n' > specs.txt
+          printf '%s\n' "$VARIANTS" | tr ';' '\n' > specs.txt
           while IFS= read -r spec; do
             [ -z "$spec" ] && continue
-            label=${spec%%=*}; assigns=${spec#*=}
-            if (eval "export $assigns; CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q") && cp /tmp/t-$label/release/shopping bin-$label; then
+            label=${spec%%=*}; assigns=${spec#*=}; EXTRA=""
+            case "$label" in pgo*)
+              # profile-guided: instrumented build, train on other seeds, rebuild with the profile
+              rustup component add llvm-tools >/dev/null 2>&1; PD=$(find ~/.rustup -name llvm-profdata | head -1)
+              [ -f "$RUNNER_TEMP/tr7/manifest.json" ] || tools/generator/target/release/generate --seed 7 --events 4000000 --clicks 1000000 --output "$RUNNER_TEMP/tr7" >/dev/null 2>&1
+              [ -f "$RUNNER_TEMP/tr8/manifest.json" ] || tools/generator/target/release/generate --seed 8 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/tr8" >/dev/null 2>&1
+              (eval "export $assigns"; RUSTFLAGS="$RUSTFLAGS -Cprofile-generate=/tmp/pgo-$label" CARGO_TARGET_DIR=/tmp/t-$label-gen cargo build --release -q)                 && for d in tr7 tr8; do DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) /tmp/t-$label-gen/release/shopping; done                 && ls /tmp/pgo-$label | head -3 && $PD merge -o /tmp/pgo-$label.profdata /tmp/pgo-$label/*.profraw                 && EXTRA="-Cprofile-use=/tmp/pgo-$label.profdata" ;;
+            esac
+            if (eval "export $assigns"; export RUSTFLAGS="$RUSTFLAGS $EXTRA"; CARGO_TARGET_DIR=/tmp/t-$label cargo build --release -q) && cp /tmp/t-$label/release/shopping bin-$label; then
               o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./bin-$label
               echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
               echo "$label ./bin-$label" >> v.txt
