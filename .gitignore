@@ -1,4 +1,6 @@
 target/
-out/
-dev/
-*.parquet
+/data/
+/dev/
+/out/
+__pycache__/
+*.pyc

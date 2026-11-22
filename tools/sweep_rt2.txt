@@ -1,7 +1,0 @@
-# confirmation of the best runtime candidates from the first sweep
-base     ./lanebin
-base2    ./lanebin
-r3_0     ./lanebin XL_R3=0
-spin100  ./lanebin XL_SPIN=100
-pparts0  ./lanebin XL_PPARTS=0
-combo    ./lanebin XL_R3=0 XL_SPIN=100 XL_PPARTS=0

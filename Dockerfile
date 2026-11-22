@@ -1,36 +1,42 @@
-# Shopping Sessions: one statically linked Rust binary in an empty image.
-# The scorer builds this natively for linux/amd64 and runs CMD as uid 1000
-# with a read-only root, no network, /data read-only and /output writable.
-FROM rust:1-bookworm AS build
-WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY tools/generator ./tools/generator
-# Scorers are Intel Xeon, Cascade Lake or newer: build for Cascade Lake (AVX-512).
-# Measured 23-28% faster than x86-64-v3 on CI, identical output.
-ENV BASE_FLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static"
-ENV T=x86_64-unknown-linux-gnu
-# Profile-guided build (measured 2.5-2.8% faster, identical output): train on
-# small datasets from the official generator (seeds unrelated to any scoring
-# data), then rebuild with the profile. If any training step fails, fall back
-# to the plain build, so the image always builds.
-RUN set -e; \
-    if ( rustup component add llvm-tools \
-         && cargo build --release --locked --manifest-path tools/generator/Cargo.toml \
-         && tools/generator/target/release/generate --seed 7 --events 4000000 --clicks 1000000 --output /tmp/tr7 \
-         && tools/generator/target/release/generate --seed 8 --events 1000000 --clicks 250000 --output /tmp/tr8 \
-         && RUSTFLAGS="$BASE_FLAGS -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target $T --target-dir /tmp/gen \
-         && mkdir -p /tmp/o7 /tmp/o8 \
-         && DATA_DIR=/tmp/tr7 OUTPUT_DIR=/tmp/o7 NCPU=8 /tmp/gen/$T/release/shopping \
-         && DATA_DIR=/tmp/tr8 OUTPUT_DIR=/tmp/o8 NCPU=8 /tmp/gen/$T/release/shopping \
-         && "$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)" merge -o /tmp/pgo.profdata /tmp/pgo ); \
-    then echo "PGO build"; RUSTFLAGS="$BASE_FLAGS -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --target $T; \
-    else echo "plain build"; RUSTFLAGS="$BASE_FLAGS" cargo build --release --locked --target $T; \
-    fi; \
-    strip target/$T/release/shopping && cp target/$T/release/shopping /shopping
+# Shopping Sessions: hybrid of Team 67 express fast path + our engine fallback
 
+# Stage 1: build our shopping-sessions engine
+FROM rust:1.91-slim-bookworm AS build-ours
+WORKDIR /src
+ENV CARGO_TERM_COLOR=never \
+    RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+ARG TARGET=x86_64-unknown-linux-gnu
+
+# Dependencies first, so source edits rebuild only the crates themselves.
+COPY shopping-sessions/Cargo.toml shopping-sessions/Cargo.lock ./
+COPY shopping-sessions/generic/Cargo.toml shopping-sessions/generic/Cargo.lock ./generic/
+RUN mkdir -p src generic/src && echo 'fn main() {}' > src/main.rs && cp src/main.rs generic/src/main.rs \
+ && cargo build --release --locked --target $TARGET \
+ && cargo build --release --locked --target $TARGET --manifest-path generic/Cargo.toml \
+ && rm -rf src generic/src target/$TARGET/release/.fingerprint/shopping-sessions-* \
+           generic/target/$TARGET/release/.fingerprint/shopping-sessions-*
+
+COPY shopping-sessions/src ./src
+COPY shopping-sessions/generic/src ./generic/src
+RUN cargo build --release --locked --target $TARGET \
+ && cargo build --release --locked --target $TARGET --manifest-path generic/Cargo.toml \
+ && cp target/$TARGET/release/shopping-sessions /shopping-sessions \
+ && cp generic/target/$TARGET/release/shopping-sessions-generic /shopping-sessions-generic
+
+# Stage 2: build express
+FROM rust:1-alpine AS build-express
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY express/Cargo.toml express/Cargo.lock ./
+COPY express/.cargo .cargo
+COPY express/src src
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
+
+# Stage 3: final scratch image
 FROM scratch
-COPY --from=build /shopping /shopping
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
+COPY --from=build-express /pipeline /pipeline
+COPY --from=build-ours /shopping-sessions /shopping-sessions
+COPY --from=build-ours /shopping-sessions-generic /shopping-sessions-generic
 USER 1000:1000
-CMD ["/shopping"]
+ENTRYPOINT ["/pipeline"]

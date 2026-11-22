@@ -1,48 +1,61 @@
 # Shopping Sessions
 
-**Shipped pipeline (`src/`, Rust, built by the root Dockerfile):** our own independent
-implementation of `rules.md`, written by our team. It parses every CSV with a SIMD line
-scanner, deduplicates events by exact ID, joins linked IDs with union-find, sessionizes
-per person and writes both Parquet tables with a hand-written writer. IDs are treated as
-opaque byte strings (short ones packed into integers, long ones interned), as scorer v5
-requires.
+A single static Rust binary that turns the dirty click-stream CSVs in `/data` into the two exact daily
+Parquet tables `/output/user_daily/` and `/output/campaign_daily/`, following `rules.md`.
 
-CI (`.github/workflows/own.yml`) runs the 36 fixtures, the official v5 dev answer
-(`tools/dev-answer/`), an exact 20M cross-check, phase timings and container timing. The
-official v5 generator source is in `tools/generator`.
+## Credits and layout
 
-**History:** earlier submissions used other engines (an adaptation of
-[Dremix10/shopping-sessions-fast](https://github.com/Dremix10/shopping-sessions-fast) and
-Team 67's MIT [Express Lane](https://github.com/jason-scheffel/express-lane)). After the
-organizers' rule that entries must be the team's own work, main ships only our own code;
-that earlier work, with its credits, is kept on the `archive/pre-v5` branch. See
-[`attempts/`](attempts/README.md).
+- **`express/`: the pipeline in the image.** It is based on Team 67's Express Lane
+  (github.com/jason-scheffel/express-lane, commit 92cf412), used under the MIT License; Team 67's
+  copyright notice is kept in `LICENSE`. It infers a compact ID representation from the input, checks
+  it as it goes, and re-runs itself in an exact generic mode when the data breaks its assumptions.
+  Our changes to it are in the git history after the commit that imports it. It needs AVX-512
+  (built for Cascade Lake, the scorer's CPU).
+- **Profile-guided optimization, tried and dropped.** `scripts/pgo/` builds an instrumented pipeline
+  (feature `pgo-gen`) and merges its profile on never-scored generator seeds; a scorer A/B (BENCH.md,
+  P8) found no measurable gain, so the image is built without it.
+- **`probe/`: scorer A/B measurements** (`scripts/probe/`, used only in probe commits, never a candidate).
+- **`src/`, `generic/`: our own earlier pipeline** (scored 1.01 s, commit 14b4668), described below.
+  It is kept in the repository and its tests, but it is not in the image.
 
+## Our earlier pipeline (`src/`)
 
-## Design
+All phases run on `NCPU` threads over memory-mapped inputs split into line-aligned chunks.
 
-1. **Parse (parallel).** Every CSV is memory-mapped and cut into ~4 MB newline-aligned chunks (the dialect never puts a newline inside a value, so any `\n` is a safe cut). Worker threads parse events and clicks; events are routed into 256 partitions by a hash of `event_id`. Links are joined on their own thread at the same time (union-find; the byte-wise smallest ID names the person).
-2. **Dedup (parallel over event_id partitions).** Open-addressing table keeps the copy with the smallest `ingest_ts`; validity of each copy is decided at parse time, so an invalid earliest copy still wins and drops the event. Survivors and clicks are re-routed into 256 partitions by person.
-3. **Sessions (parallel over person partitions).** Sort by (person, ts), split at gaps over 30 min, credit each session to the latest click within 7 days (ties: smallest `click_id`) with a two-pointer sweep, and count assisting campaigns with a sliding window over distinct campaigns. Each worker writes its own `user_daily` Parquet file.
+1. **Lookups.** `manifest.json`, `products.csv` and `campaigns.csv`. Category ids follow byte-wise name order
+   (with `unknown`), so top-category ties resolve to the smallest id.
+2. **IDs as exact 64-bit keys.** An ID of 1 to 10 bytes in `[0-9A-Z_a-z]` is packed 6 bits per byte, so
+   integer order is byte order. Any other ID is interned and compared by its bytes.
+3. **Links.** Parsed in parallel, then a union-find names every person by the byte-wise smallest of their
+   IDs. This runs on one thread while the others parse events and clicks.
+4. **Events.** Each well-formed copy is validated on its own fields (window, type, product, price, late
+   check) and scattered by `event_id`. Clicks are validated (form of `ts`, campaign known) and kept.
+5. **Dedup.** Per `event_id` partition, the copy with the smallest `ingest_ts` wins. Surviving kept copies
+   are mapped to their person and scattered by person, and so are clicks.
+6. **Sessions.** Per person partition: sort by time, split on gaps over 30 minutes, credit the latest click
+   in the 7 days up to the session start (ties to the smallest `click_id`), and count assists from a
+   sliding window of per-campaign counts.
+7. **Output.** Each thread writes its own `user_daily` file; `campaign_daily` is merged and written once.
 
-IDs of 1–10 chars from `[0-9A-Z_a-z]` are packed into order-preserving 60-bit integers; anything else is interned, so comparisons stay exact.
-
-## Checks
+## Build and run
 
 ```sh
-cargo build --release
-python3 scripts/run_fixtures.py fixtures -- target/release/shopping   # 36/36
-DATA_DIR=dev OUTPUT_DIR=out target/release/shopping && python3 scripts/compare.py out dev-answer
+docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+python scripts/docker_run.py DATA_DIR OUTPUT_DIR     # scorer flags; also scripts/docker_run.sh
 ```
 
-`SHOP_PROFILE=1` prints phase timings to stderr.
+Without Docker: `cargo build --release`, then `target/release/shopping-sessions DATA_DIR OUTPUT_DIR`
+(or set `DATA_DIR` / `OUTPUT_DIR`).
 
-## Practice-size data on a low-memory machine
+## Testing
 
-The official generator holds the whole dataset in RAM before writing. `tools/gen-lowmem` is a copy that generates users in batches and appends each batch to the part files: every row lands in the same file as with the official generator, only the line order inside a file differs (which the rules make irrelevant; verified on the 1M dev set: identical files up to line order, and the pipeline output still matches the dev answer).
+- `cargo test --release`: unit tests for timestamps, the CSV dialect, chunking and key order.
+- `python scripts/run_fixtures.py fixtures -- <binary>`: the 36 edge-case fixtures.
+- `python scripts/compare.py OUT dev-answer`: exact diff against the published dev answer.
+- `reference/reference.py`: an independent, literal, slow implementation of `rules.md`, used as an oracle.
+- `python scripts/diff_seeds.py GENERATE BINARY ROOT`: pipeline vs reference over many generator seeds
+  (including windows holding Feb 29 2028, Mar 1 and New Year) and thread/partition settings.
+- `python scripts/fuzz.py BINARY`: thousands of small adversarial datasets, pipeline vs reference, with
+  random thread counts, chunk sizes down to 1 byte and partition counts.
 
-```powershell
-cargo build --release --manifest-path tools/gen-lowmem/Cargo.toml
-tools/gen-lowmem/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --threads 8 --output D:/data/p20
-powershell -File tools/bench.ps1 -Data D:\data\p20 -Exe target\release\shopping.exe -Runs 3
-```
+Knobs for testing only: `NCPU`, `SS_CHUNK` (chunk bytes), `SS_PARTS` (partition count).

@@ -1,0 +1,18 @@
+# Profile-guided optimization, step 1 (local only, never the scored image).
+#   target `tools`: the toolchain with llvm-profdata, to merge the raw profiles
+#   default target: the instrumented pipeline (feature pgo-gen) in an empty image
+FROM rust:1.100.0-alpine AS tools
+RUN apk add --no-cache musl-dev && rustup component add llvm-tools
+WORKDIR /src
+COPY express/Cargo.toml express/Cargo.lock ./
+COPY express/.cargo .cargo
+COPY express/src src
+RUN cargo rustc --release --target x86_64-unknown-linux-musl --features pgo-gen -- -Cprofile-generate=/tmp/pgo \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline-gen \
+ && ln -s "$(find / -name llvm-profdata -type f 2>/dev/null | head -1)" /usr/local/bin/llvm-profdata \
+ && llvm-profdata --version
+
+FROM scratch
+COPY --from=tools /pipeline-gen /pipeline
+USER 1000:1000
+CMD ["/pipeline"]
