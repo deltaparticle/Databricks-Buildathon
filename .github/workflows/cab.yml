@@ -56,7 +56,7 @@ jobs:
           pip install --quiet polars
           tools/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" > /dev/null 2>&1
           for img in $(cat imgs.txt); do
-            c=$(docker create "img_$img"); bin=$(docker inspect -f '{{index .Config.Cmd 0}}{{index .Config.Entrypoint 0}}' "img_$img" | sed 's/<no value>//g')
+            c=$(docker create "img_$img"); bin=$(docker inspect -f '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "img_$img" | grep -o '"/[^"]*"' | head -1 | tr -d '"')
             docker cp "$c:$bin" "./bin_$img" > /dev/null; docker rm "$c" > /dev/null
             echo "$img fixtures: $(python3 scripts/run_fixtures.py fixtures -- "$PWD/bin_$img" | tail -1)"
             o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$o" NCPU=$(nproc) "./bin_$img"
