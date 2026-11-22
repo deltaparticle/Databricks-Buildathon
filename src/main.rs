@@ -1004,8 +1004,8 @@ fn write_user(path: &Path, r: UserRows) {
 fn main() {
     let t0 = Instant::now();
     let _ = T0.set(t0);
-    if std::env::var_os("SHOP_NOTABLE").is_some() {
-        keys::NOTABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("SHOP_EXACT_LONG").is_some() {
+        keys::EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
     let lap = |what: &str| {
@@ -1093,6 +1093,20 @@ fn main() {
         p1
     });
     let aliases = aliases_cell.into_inner().expect("links");
+    // Every parsing thread has finished: check the long-ID keys (see keys.rs).
+    // In the rare case a key is shared or a comparison could not be settled,
+    // run again from the start with exact long-ID interning (nothing is written yet).
+    if !keys::verify_longs(threads) {
+        if profile {
+            eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(std::env::args_os().skip(1))
+            .env("SHOP_EXACT_LONG", "1")
+            .status()
+            .expect("exact re-run");
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if profile {
         let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
         let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();

@@ -67,11 +67,7 @@ pub fn key(s: &[u8], pfx: u8) -> u64 {
         None => {
             if s.len() == 33 && s[0] == pfx {
                 if let Some(v) = hex128(&s[1..]) {
-                    if NOTABLE.load(std::sync::atomic::Ordering::Relaxed) {
-                        // measurement only (SHOP_NOTABLE=1): key by the top 55 bits, no table
-                        return HEX_TAG | ((v >> 73) as u64) << 8;
-                    }
-                    return intern_hex(v);
+                    return long_key(v);
                 }
             }
             intern(s)
@@ -82,17 +78,126 @@ pub fn key(s: &[u8], pfx: u8) -> u64 {
 // ---- Long IDs: the column letter plus exactly 32 lowercase hex digits ----
 //
 // Scorer v5 gives one in eight IDs this form. Such an ID is exactly a 128-bit
-// number (fixed width, lowercase), so it is interned by value in one of 256
-// independently locked shards instead of by string under one global lock.
-// Keys: bit 63 set, low byte zero (never raw), shard in bits 8..16, index in
-// the shard above that. Two such IDs of one column compare like their numbers,
-// because fixed-width lowercase hex sorts like the value.
+// number, and fixed-width lowercase hex sorts like that number.
+//
+// Fast mode (default): the key is the top 55 bits of the value (bit 63 set,
+// low byte zero, so never raw), computed with no table and no lock. Each value
+// is also appended to the calling thread's own list. After parsing,
+// `verify_longs` sorts all values and checks that no two different values
+// share a key; the sorted unique values then serve `bytes`. If a key is shared
+// (or a comparison could not be decided from keys before verification), the
+// caller re-runs the whole pipeline in exact mode.
+//
+// Exact mode (SHOP_EXACT_LONG=1): values are interned in 256 independently
+// locked shards; the key holds the shard and the index.
+
+use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
 
 const HEX_TAG: u64 = 1 << 63;
 
-/// Measurement switch (SHOP_NOTABLE=1): skip the long-ID table to see its cost.
-/// Output is not guaranteed exact with it on; never set in production.
-pub static NOTABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Exact mode switch (set at start from SHOP_EXACT_LONG).
+pub static EXACT: AtomicBool = AtomicBool::new(false);
+/// Set when fast mode met something it cannot settle (forces an exact re-run).
+static NEED_EXACT: AtomicBool = AtomicBool::new(false);
+
+// Per-thread value lists, one slot per thread, claimed on first use. A slot is
+// written only by its own thread; `verify_longs` reads them after every worker
+// thread has finished.
+const STRIPES: usize = 1024;
+struct Stripe(UnsafeCell<Vec<u128>>);
+unsafe impl Sync for Stripe {}
+static STRIPE: [Stripe; STRIPES] = [const { Stripe(UnsafeCell::new(Vec::new())) }; STRIPES];
+static NEXT_STRIPE: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static MY_STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Sorted unique long values, filled by `verify_longs`.
+static LONGS: RwLock<Vec<u128>> = RwLock::new(Vec::new());
+static VERIFIED: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+fn long_key(v: u128) -> u64 {
+    if EXACT.load(AO::Relaxed) {
+        return intern_hex(v);
+    }
+    let s = MY_STRIPE.with(|c| {
+        let mut s = c.get();
+        if s == usize::MAX {
+            s = NEXT_STRIPE.fetch_add(1, AO::Relaxed);
+            c.set(s);
+        }
+        s
+    });
+    if s < STRIPES {
+        unsafe { (*STRIPE[s].0.get()).push(v) };
+    } else {
+        NEED_EXACT.store(true, AO::Relaxed);
+    }
+    HEX_TAG | ((v >> 73) as u64) << 8
+}
+
+/// After all parsing threads have finished: check that every long key stands
+/// for one value and build the lookup table. False means "re-run exactly".
+pub fn verify_longs(threads: usize) -> bool {
+    if EXACT.load(AO::Relaxed) {
+        return true;
+    }
+    if NEED_EXACT.load(AO::Relaxed) {
+        return false;
+    }
+    let n = NEXT_STRIPE.load(AO::Relaxed).min(STRIPES);
+    let mut all: Vec<Vec<u128>> = (0..n).map(|i| std::mem::take(unsafe { &mut *STRIPE[i].0.get() })).collect();
+    let total: usize = all.iter().map(|v| v.len()).sum();
+    if total == 0 {
+        VERIFIED.store(true, AO::Relaxed);
+        return true;
+    }
+    // Bucket by the top 8 bits (values are spread out), then sort buckets in parallel.
+    const B: usize = 256;
+    let mut buckets: Vec<Vec<u128>> = (0..B).map(|_| Vec::with_capacity(total / B + 16)).collect();
+    for list in all.drain(..) {
+        for v in list {
+            buckets[(v >> 120) as usize].push(v);
+        }
+    }
+    let ok = AtomicBool::new(true);
+    let next = AtomicUsize::new(0);
+    let cells: Vec<UnsafeCellVec> = buckets.into_iter().map(|b| UnsafeCellVec(UnsafeCell::new(b))).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, AO::Relaxed);
+                if i >= B {
+                    break;
+                }
+                let b = unsafe { &mut *cells[i].0.get() };
+                b.sort_unstable();
+                b.dedup();
+                for w in b.windows(2) {
+                    if (w[0] >> 73) == (w[1] >> 73) {
+                        ok.store(false, AO::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    if !ok.load(AO::Relaxed) {
+        return false;
+    }
+    let mut table = Vec::with_capacity(total);
+    for c in cells {
+        table.extend(c.0.into_inner());
+    }
+    *LONGS.write().unwrap() = table;
+    VERIFIED.store(true, AO::Relaxed);
+    !NEED_EXACT.load(AO::Relaxed)
+}
+
+struct UnsafeCellVec(UnsafeCell<Vec<u128>>);
+unsafe impl Sync for UnsafeCellVec {}
+
 const HEX_SHARDS: usize = 256;
 
 #[derive(Default)]
@@ -137,7 +242,7 @@ fn hex128(s: &[u8]) -> Option<u128> {
     Some(v)
 }
 
-#[inline]
+/// Exact mode: intern by value in a sharded table.
 fn intern_hex(v: u128) -> u64 {
     let shard = ((v as u64) ^ ((v >> 64) as u64)) as usize & (HEX_SHARDS - 1);
     let mut guard = HEX[shard].lock().unwrap();
@@ -156,13 +261,30 @@ fn is_hex(k: u64) -> bool {
     k & HEX_TAG != 0 && !is_raw(k)
 }
 
-fn hex_value(k: u64) -> u128 {
-    if NOTABLE.load(std::sync::atomic::Ordering::Relaxed) {
-        return ((k & !HEX_TAG) >> 8) as u128; // measurement only: order by key, placeholder value
+/// The 128-bit value behind a long key. Fast mode needs `verify_longs` first.
+fn hex_value(k: u64) -> Option<u128> {
+    if EXACT.load(AO::Relaxed) {
+        let shard = ((k >> 8) & 0xFF) as usize;
+        let idx = ((k & !HEX_TAG) >> 16) as usize;
+        return Some(HEX[shard].lock().unwrap().as_ref().unwrap().vals[idx]);
     }
-    let shard = ((k >> 8) & 0xFF) as usize;
-    let idx = ((k & !HEX_TAG) >> 16) as usize;
-    HEX[shard].lock().unwrap().as_ref().unwrap().vals[idx]
+    if !VERIFIED.load(AO::Relaxed) {
+        return None;
+    }
+    let top = (k & !HEX_TAG) >> 8;
+    let t = LONGS.read().unwrap();
+    let i = t.partition_point(|&v| ((v >> 73) as u64) < top);
+    (i < t.len() && (t[i] >> 73) as u64 == top).then(|| t[i])
+}
+
+/// Fast mode, before verification: the first `n` hex digits (n <= 13) of the
+/// value behind a long key, from the key alone.
+fn hex_prefix(k: u64, n: usize, out: &mut Vec<u8>) {
+    let top = (k & !HEX_TAG) >> 8; // 55 bits = the top 13.75 hex digits
+    for i in 0..n {
+        let nib = (top >> (51 - 4 * i)) & 15;
+        out.push(b"0123456789abcdef"[nib as usize]);
+    }
 }
 
 #[cold]
@@ -189,9 +311,17 @@ pub fn bytes(k: u64, pfx: u8, out: &mut Vec<u8>) {
         out.extend_from_slice(&b[..n]);
     } else if is_hex(k) {
         out.push(pfx);
-        let v = hex_value(k);
-        for i in (0..32).rev() {
-            out.push(b"0123456789abcdef"[((v >> (4 * i)) & 15) as usize]);
+        match hex_value(k) {
+            Some(v) => {
+                for i in (0..32).rev() {
+                    out.push(b"0123456789abcdef"[((v >> (4 * i)) & 15) as usize]);
+                }
+            }
+            None => {
+                // only reachable in fast mode before verification: never written out
+                NEED_EXACT.store(true, AO::Relaxed);
+                hex_prefix(k, 13, out);
+            }
         }
     } else {
         out.extend_from_slice(&FROZEN.read().unwrap()[((k >> 8) - 1) as usize]);
@@ -205,13 +335,40 @@ pub fn cmp(a: u64, b: u64, pfx: u8) -> Ordering {
         return a.swap_bytes().cmp(&b.swap_bytes());
     }
     if is_hex(a) && is_hex(b) {
-        return if a == b { Ordering::Equal } else { hex_value(a).cmp(&hex_value(b)) };
+        if a == b {
+            return Ordering::Equal;
+        }
+        if !EXACT.load(AO::Relaxed) {
+            // fast mode: keys are the top 55 bits; distinct keys order like the values
+            return a.cmp(&b);
+        }
+        return hex_value(a).cmp(&hex_value(b));
     }
     cmp_slow(a, b, pfx)
 }
 
 #[cold]
 fn cmp_slow(a: u64, b: u64, pfx: u8) -> Ordering {
+    let fast_unverified = !EXACT.load(AO::Relaxed) && !VERIFIED.load(AO::Relaxed);
+    if fast_unverified && (is_hex(a) || is_hex(b)) {
+        // exactly one side is long; compare the other side with the long ID's
+        // known prefix (column letter + 13 hex digits)
+        let (long, other, flip) = if is_hex(a) { (a, b, false) } else { (b, a, true) };
+        let mut o = Vec::new();
+        bytes(other, pfx, &mut o);
+        let mut l = vec![pfx];
+        hex_prefix(long, 13, &mut l);
+        let n = o.len().min(l.len());
+        let r = match o[..n].cmp(&l[..n]) {
+            Ordering::Equal if o.len() <= l.len() => Ordering::Less, // other is a proper prefix of the 33-byte ID
+            Ordering::Equal => {
+                NEED_EXACT.store(true, AO::Relaxed);
+                Ordering::Equal
+            }
+            r => r,
+        };
+        return if flip { r.reverse() } else { r };
+    }
     let (mut x, mut y) = (Vec::new(), Vec::new());
     bytes(a, pfx, &mut x);
     bytes(b, pfx, &mut y);
