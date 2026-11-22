@@ -347,27 +347,39 @@ pub fn cmp(a: u64, b: u64, pfx: u8) -> Ordering {
     cmp_slow(a, b, pfx)
 }
 
+/// Byte order of `other` (a whole ID that is not a long one) against the long
+/// ID behind fast-mode key `long`, using only the key's 13 known hex digits.
+/// None when those digits cannot settle it.
+fn other_vs_long_prefix(other: &[u8], long: u64, pfx: u8) -> Option<Ordering> {
+    let mut l = vec![pfx];
+    hex_prefix(long, 13, &mut l);
+    let n = other.len().min(l.len());
+    match other[..n].cmp(&l[..n]) {
+        // other is a prefix of the known part and shorter than 33 bytes: a proper prefix
+        Ordering::Equal if other.len() <= l.len() => Some(Ordering::Less),
+        Ordering::Equal => None,
+        r => Some(r),
+    }
+}
+
 #[cold]
 fn cmp_slow(a: u64, b: u64, pfx: u8) -> Ordering {
     let fast_unverified = !EXACT.load(AO::Relaxed) && !VERIFIED.load(AO::Relaxed);
     if fast_unverified && (is_hex(a) || is_hex(b)) {
         // exactly one side is long; compare the other side with the long ID's
         // known prefix (column letter + 13 hex digits)
-        let (long, other, flip) = if is_hex(a) { (a, b, false) } else { (b, a, true) };
+        // r below is cmp(other, long); cmp(a, b) is r when a is the other side
+        let (long, other, a_is_long) = if is_hex(a) { (a, b, true) } else { (b, a, false) };
         let mut o = Vec::new();
         bytes(other, pfx, &mut o);
-        let mut l = vec![pfx];
-        hex_prefix(long, 13, &mut l);
-        let n = o.len().min(l.len());
-        let r = match o[..n].cmp(&l[..n]) {
-            Ordering::Equal if o.len() <= l.len() => Ordering::Less, // other is a proper prefix of the 33-byte ID
-            Ordering::Equal => {
+        let r = match other_vs_long_prefix(&o, long, pfx) {
+            Some(r) => r,
+            None => {
                 NEED_EXACT.store(true, AO::Relaxed);
                 Ordering::Equal
             }
-            r => r,
         };
-        return if flip { r.reverse() } else { r };
+        return if a_is_long { r.reverse() } else { r };
     }
     let (mut x, mut y) = (Vec::new(), Vec::new());
     bytes(a, pfx, &mut x);
@@ -389,11 +401,29 @@ mod tests {
             b"u0123456789abcdef0123456789abcdeF", b"u0123456789abcdef0123456789abcde", b"u0123456789abcdef0123456789abcdef0",
             b"e0123456789abcdef0123456789abcdef", b"ua23456789abcdef0123456789abcdef0", b"u9fffffffffffffffffffffffffffffff",
             b"k0123456789abcdef0123456789abcdef", b"u0123456789abcdeg0123456789abcdef",
+            b"U0123456789ABCDEF0123456789ABCDEF", b"U3BQELVHV", b"u0123456789abcd", b"u0123456789abcde", b"u0123",
         ];
         // fast mode: key everything (recording long values), then verify
         for pfx in [b'u', b'e', b'k'] {
             for a in &words {
                 let _ = key(a, pfx);
+            }
+        }
+        // before verification: a long ID against any other ID, from the key's prefix alone
+        for pfx in [b'u', b'e', b'k'] {
+            for a in &words {
+                let ka = key(a, pfx);
+                if !is_hex(ka) {
+                    continue;
+                }
+                for b in &words {
+                    if is_hex(key(b, pfx)) {
+                        continue;
+                    }
+                    if let Some(r) = other_vs_long_prefix(b, ka, pfx) {
+                        assert_eq!(r, b.cmp(a), "prefix order {:?} vs {:?}", String::from_utf8_lossy(b), String::from_utf8_lossy(a));
+                    }
+                }
             }
         }
         assert!(verify_longs(2), "long keys verify");
