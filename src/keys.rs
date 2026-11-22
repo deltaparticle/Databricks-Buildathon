@@ -390,6 +390,13 @@ mod tests {
             b"e0123456789abcdef0123456789abcdef", b"ua23456789abcdef0123456789abcdef0", b"u9fffffffffffffffffffffffffffffff",
             b"k0123456789abcdef0123456789abcdef", b"u0123456789abcdeg0123456789abcdef",
         ];
+        // fast mode: key everything (recording long values), then verify
+        for pfx in [b'u', b'e', b'k'] {
+            for a in &words {
+                let _ = key(a, pfx);
+            }
+        }
+        assert!(verify_longs(2), "long keys verify");
         for pfx in [b'u', b'e', b'k'] {
             for a in &words {
                 let mut out = Vec::new();
