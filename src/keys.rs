@@ -157,6 +157,9 @@ fn is_hex(k: u64) -> bool {
 }
 
 fn hex_value(k: u64) -> u128 {
+    if NOTABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return ((k & !HEX_TAG) >> 8) as u128; // measurement only: order by key, placeholder value
+    }
     let shard = ((k >> 8) & 0xFF) as usize;
     let idx = ((k & !HEX_TAG) >> 16) as usize;
     HEX[shard].lock().unwrap().as_ref().unwrap().vals[idx]
