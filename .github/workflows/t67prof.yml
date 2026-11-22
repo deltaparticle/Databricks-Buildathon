@@ -1,0 +1,55 @@
+name: t67prof
+
+# Profile a mirrored Express Lane branch on v5 20M data: phase timings
+# (XL_TIMING=1), counters, and perf (top symbols, hottest lines/instructions).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: true
+        default: "exp/t67-c4a033b"
+
+permissions:
+  contents: read
+
+jobs:
+  prof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Machine
+        run: |
+          nproc; lscpu | grep "Model name"
+          for f in avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni; do
+            grep -qw $f /proc/cpuinfo || { echo "::error::runner lacks $f; re-run the job"; exit 1; }
+          done
+          echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+      - name: Build
+        run: |
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          git worktree add -q /tmp/t67 "origin/${{ github.event.inputs.ref }}"
+          (cd /tmp/t67 && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -q) && cp /tmp/t67/target/release/pipeline ./t67bin
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-azure >/dev/null 2>&1 || true
+      - name: Phases
+        run: |
+          for i in 1 2 3; do
+            /usr/bin/time -f "wall=%e user=%U sys=%S maxrss=%MKB minflt=%R" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) XL_TIMING=1 ./t67bin 2>&1 | grep -E "\[v2b\]|\[v3|wall=|ms:"
+          done
+      - name: perf
+        run: |
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); PERF=${PERF:-perf}
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          for i in 1 2 3; do $PERF record -q -F 19999 -o p$i.data env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$(mktemp -d)" NCPU=$(nproc) ./t67bin >/dev/null 2>&1; done
+          echo "===== symbols"
+          $PERF report -i p1.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -45
+          $PERF report -i p1.data --no-children --sort sym --stdio 2>/dev/null | grep -E "^ +[0-9]" | head -10 | sed -E 's/^ +[0-9.]+% +\[[.k]\] //' > syms.txt
+          while IFS= read -r full; do
+            echo "===================== $full"
+            $PERF annotate -i p1.data --stdio -l "$full" 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+ +[a-z_/.]+\.rs:[0-9]+" | sort -nr | head -12
+            echo "--- hottest instructions"
+            for i in 1 2 3; do $PERF annotate -i p$i.data --stdio --no-source "$full" 2>/dev/null; done | grep -E "^ +[0-9]+\.[0-9]+ +:" | sort -nr | head -14
+          done < syms.txt
