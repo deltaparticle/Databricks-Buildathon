@@ -46,7 +46,8 @@ jobs:
           echo cur > imgs.txt
           for r in ${{ github.event.inputs.refs }}; do
             lab=$(printf '%s' "$r" | tr -c 'a-zA-Z0-9' '_' | tr 'A-Z' 'a-z')
-            git fetch -q origin "$r" && git worktree add -q "/tmp/w-$lab" FETCH_HEAD
+            sha=$(git rev-parse -q --verify "$r^{commit}" || git rev-parse -q --verify "origin/$r^{commit}" || { git fetch -q origin "$r" && git rev-parse FETCH_HEAD; })
+            git worktree add -q "/tmp/w-$lab" "$sha"
             docker build -q -t "img_$lab" "/tmp/w-$lab" > /dev/null && echo "$lab" >> imgs.txt
           done
           cat imgs.txt
