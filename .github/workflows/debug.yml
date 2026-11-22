@@ -88,6 +88,7 @@ jobs:
       - name: BOLT
         run: |
           set +e
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
           [ -n "$BOLT" ] && [ -x "$BOLT" ] || exit 0
           $BOLT --version | head -3
           echo "== hot code size (largest functions, bytes)"; nm -S --size-sort -C ./relocs | tail -12
