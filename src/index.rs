@@ -130,7 +130,22 @@ impl Index {
 }
 
 /// Bytes indexed per batch (a batch is then extended to the next newline).
-const BATCH: usize = 64 << 10;
+/// Build-time override for tuning: SHOP_BATCH_KB.
+const BATCH: usize = (match option_env!("SHOP_BATCH_KB") {
+    Some(s) => parse_usize(s),
+    None => 64,
+}) << 10;
+
+const fn parse_usize(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut v = 0;
+    while i < b.len() {
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    v
+}
 
 /// Call `f` with the `N` unquoted fields of every well-formed line of `data`,
 /// in order: the same lines and fields as `csv::for_lines` + `csv::split`.
