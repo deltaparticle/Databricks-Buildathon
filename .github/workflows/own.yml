@@ -82,6 +82,13 @@ jobs:
             echo "$1 $? $(python3 -c "print(round($(date +%s.%N)-$s,4))")" >> t.txt
           }
           for i in $(seq 8); do for img in $imgs; do run $img; done; done
+          echo "== inside the container: phase timings (program's own clock) vs docker's start/finish"
+          for i in 1 2 3; do
+            out=$(mktemp -d); chmod 777 "$out"
+            id=$(docker create --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL               --security-opt no-new-privileges --pids-limit 4096 --cpus "$(nproc)" --memory 14g --memory-swap 14g               --user 1000:1000 -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" -e SHOP_PROFILE=1 cur)
+            docker start -a "$id" 2>&1 >/dev/null | grep -E "s (parse|dedup|sessions|write)$"
+            docker inspect -f 'docker StartedAt {{.State.StartedAt}} FinishedAt {{.State.FinishedAt}}' "$id"; docker rm "$id" > /dev/null
+          done
           python3 -c "
           import statistics as st
           rows=[l.split() for l in open('t.txt')]
