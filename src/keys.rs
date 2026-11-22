@@ -227,9 +227,39 @@ struct HexShard {
 
 static HEX: [Mutex<Option<HexShard>>; HEX_SHARDS] = [const { Mutex::new(None) }; HEX_SHARDS];
 
-/// Value of exactly 32 lowercase hex digits.
+/// Value of exactly 32 lowercase hex digits, eight at a time (SWAR).
 #[inline(always)]
 fn hex128(s: &[u8]) -> Option<u128> {
+    let w = |i: usize| u64::from_le_bytes(s[8 * i..8 * i + 8].try_into().unwrap());
+    let (a, b, c, d) = (hex8(w(0))?, hex8(w(1))?, hex8(w(2))?, hex8(w(3))?);
+    Some((a as u128) << 96 | (b as u128) << 64 | (c as u128) << 32 | d as u128)
+}
+
+/// Eight lowercase hex digits (first digit in the low byte) to their value,
+/// or None if any byte is not 0-9 or a-f.
+#[inline(always)]
+fn hex8(x: u64) -> Option<u32> {
+    const O: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = 0x8080_8080_8080_8080;
+    if x & H != 0 {
+        return None;
+    }
+    // per byte: high bit set when the byte is in [lo, hi] (bytes are < 0x80)
+    let range = |lo: u64, hi: u64| (x.wrapping_add(O * (0x80 - lo)) & !x.wrapping_add(O * (0x7F - hi))) & H;
+    if (range(b'0' as u64, b'9' as u64) | range(b'a' as u64, b'f' as u64)) != H {
+        return None;
+    }
+    // '0'..'9' -> 0..9, 'a'..'f' (bit 6 set) -> low nibble + 9
+    let n = (x & 0x0F0F_0F0F_0F0F_0F0F) + 9 * ((x >> 6) & O);
+    // pack: the first digit is the most significant
+    let p = ((n << 4) | (n >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let p = ((p << 8) | (p >> 16)) & 0x0000_FFFF_0000_FFFF;
+    let p = ((p << 16) | (p >> 32)) & 0xFFFF_FFFF;
+    Some(p as u32)
+}
+
+#[cfg(test)]
+fn hex128_slow(s: &[u8]) -> Option<u128> {
     let mut v: u128 = 0;
     for &c in &s[..32] {
         let d = match c {
@@ -390,6 +420,41 @@ fn cmp_slow(a: u64, b: u64, pfx: u8) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex128_matches_slow() {
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let alphabet = b"0123456789abcdefABCDEFgGzZ/:`@\x00\x7f\x80\xff ";
+        for round in 0..200_000 {
+            let mut s = [0u8; 32];
+            for c in s.iter_mut() {
+                // mostly valid hex, with an invalid byte now and then
+                *c = if round % 3 == 0 && next() % 16 == 0 {
+                    alphabet[(next() % alphabet.len() as u64) as usize]
+                } else {
+                    b"0123456789abcdef"[(next() % 16) as usize]
+                };
+            }
+            assert_eq!(hex128(&s), hex128_slow(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for b in 0..=255u8 {
+            let mut s = *b"0123456789abcdef0123456789abcdef";
+            for i in [0, 7, 8, 15, 31] {
+                let mut t = s;
+                t[i] = b;
+                assert_eq!(hex128(&t), hex128_slow(&t), "byte {b} at {i}");
+            }
+            s[3] = b;
+            assert_eq!(hex128(&s), hex128_slow(&s));
+        }
+    }
+
     #[test]
     fn order_and_roundtrip() {
         let words: Vec<&[u8]> = vec![
