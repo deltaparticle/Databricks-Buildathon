@@ -34,12 +34,27 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const GAP: i64 = 30 * 60 * 1000;
 const REACH: i64 = 7 * DAY;
-const P_BITS: u32 = 9;
+/// Build-time tuning overrides: SHOP_P_BITS, SHOP_Q_BITS, SHOP_CHUNK_KB.
+const fn env_num(s: Option<&str>, d: usize) -> usize {
+    match s {
+        None => d,
+        Some(s) => {
+            let b = s.as_bytes();
+            let (mut i, mut v) = (0, 0);
+            while i < b.len() {
+                v = v * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            v
+        }
+    }
+}
+const P_BITS: u32 = env_num(option_env!("SHOP_P_BITS"), 9) as u32;
 const P: usize = 1 << P_BITS;
-const Q_BITS: u32 = 7;
+const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 7) as u32;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
-const CHUNK: usize = 2 << 20;
+const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 2048) << 10;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
 const PRICE_MASK: u64 = (1 << 24) - 1;
