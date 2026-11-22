@@ -310,7 +310,7 @@ fn main() {
         eprintln!("[v2b] panic: {info}");
         sys::fallback("panic")
     }));
-    let nt: usize = std::env::var("NCPU").ok().and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8).min(16);
+    let nt: usize = std::env::var("NCPU").ok().and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8).min(16).min(4); // capped at 4 threads: the scorer's 8 vCPUs are 4 cores x 2 hyperthreads
     let timing = std::env::var("XL_TIMING").is_ok_and(|v| v == "1");
     let check = std::env::var("XL_CHECK").is_ok_and(|v| v == "1");
     if std::env::var("XL_NOHUGE").is_ok_and(|v| v == "1") {
