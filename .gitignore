@@ -1,4 +1,1 @@
-target/
-out/
-dev/
-*.parquet
+target

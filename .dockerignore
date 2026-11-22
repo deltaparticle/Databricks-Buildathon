@@ -1,6 +1,1 @@
-target/
-out/
-dev/
-fixtures/
-*.md
-.git
+target
