@@ -34,6 +34,7 @@ jobs:
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
           cp target/release/shopping ownbin
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -q 2>&1 | tail -4
           pip install --quiet polars
       - name: Fixtures
         run: python3 scripts/run_fixtures.py fixtures -- "$PWD/ownbin" | tail -2
