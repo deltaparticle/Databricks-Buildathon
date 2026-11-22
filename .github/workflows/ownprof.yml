@@ -45,4 +45,6 @@ jobs:
             full=$(echo "$s" | tr '#' ' ')
             echo "===================== $full"
             $PERF annotate -i p.data --stdio -l "$full" 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+ +[a-z_/.]+\.rs:[0-9]+" | sort -nr | head -15
+            echo "--- hottest instructions"
+            $PERF annotate -i p.data --stdio --no-source "$full" 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+ +:" | sort -nr | head -25
           done
