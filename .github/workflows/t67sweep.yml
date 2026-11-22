@@ -18,6 +18,10 @@ on:
       parts:
         required: false
         default: '["a", "b"]'
+      patches:
+        description: "Semicolon-separated label=FILE:SED_EXPR source-patched builds (compared like variants)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -42,10 +46,20 @@ jobs:
           done
           echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
       - name: Build
+        env:
+          PATCHES: ${{ github.event.inputs.patches }}
         run: |
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
           git worktree add -q /tmp/t67 "origin/${{ github.event.inputs.ref }}"
           (cd /tmp/t67 && cargo build --release -q) && cp /tmp/t67/target/release/pipeline ./t67bin
+          printf '%s\n' "$PATCHES" | tr ';' '\n' > patches.txt
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            label=${spec%%=*}; rest=${spec#*=}; file=${rest%%:*}; expr=${rest#*:}
+            rm -rf /tmp/p-$label && cp -r /tmp/t67 /tmp/p-$label && rm -rf /tmp/p-$label/target
+            sed -i "$expr" "/tmp/p-$label/$file" && grep -c . "/tmp/p-$label/$file" > /dev/null
+            (cd /tmp/p-$label && CARGO_TARGET_DIR=/tmp/tp-$label cargo build --release -q) && cp /tmp/tp-$label/release/pipeline ./bin-$label && echo "$label" >> built.txt || echo "patch build $label failed"
+          done < patches.txt
           tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
       - name: Variants
         env:
@@ -62,6 +76,11 @@ jobs:
             echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
             echo "$label ./t67bin $assigns" >> v.txt
           done < specs.txt
+          for label in $(cat built.txt 2>/dev/null); do
+            o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./bin-$label
+            echo "$label output vs base: $(cd scripts && python3 compare.py "$o" "$ref" | tail -1)"
+            echo "$label ./bin-$label" >> v.txt
+          done
           cat v.txt
       - name: Sweep
         run: python3 tools/sweep.py "$RUNNER_TEMP/p20" ${{ github.event.inputs.rounds }} v.txt
