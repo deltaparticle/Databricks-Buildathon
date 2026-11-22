@@ -51,6 +51,17 @@ jobs:
             docker build -q -t "img_$lab" "/tmp/w-$lab" > /dev/null && echo "$lab" >> imgs.txt
           done
           cat imgs.txt
+      - name: Fixtures and v5 dev answer per image (binary copied out of the image)
+        run: |
+          pip install --quiet polars
+          tools/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev" > /dev/null 2>&1
+          for img in $(cat imgs.txt); do
+            c=$(docker create "img_$img"); bin=$(docker inspect -f '{{index .Config.Cmd 0}}{{index .Config.Entrypoint 0}}' "img_$img" | sed 's/<no value>//g')
+            docker cp "$c:$bin" "./bin_$img" > /dev/null; docker rm "$c" > /dev/null
+            echo "$img fixtures: $(python3 scripts/run_fixtures.py fixtures -- "$PWD/bin_$img" | tail -1)"
+            o=$(mktemp -d); DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$o" NCPU=$(nproc) "./bin_$img"
+            echo "$img v5 dev answer: $(cd scripts && python3 compare.py "$o" ../tools/dev-answer | tail -1)"
+          done
       - name: Alternating container runs
         run: |
           pip install --quiet polars
